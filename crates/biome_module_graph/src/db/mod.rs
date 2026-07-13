@@ -11,9 +11,19 @@ use salsa::plumbing::{AsId, FromId};
 pub mod queries;
 mod type_inference;
 
+#[salsa::input(singleton)]
+pub struct ModuleGraphGeneration {
+    pub value: u64,
+}
+
 /// Extends `TypeDb` with module-graph-specific lookups.
 #[salsa::db]
 pub trait ModuleDb: TypeDb {
+    /// Returns the generation of the module path index.
+    fn module_graph_generation(&self) -> u64 {
+        0
+    }
+
     /// Given a path, it retrieves its corresponding module info.
     fn module_for_path(&self, path: &Utf8Path) -> Option<ModuleInfo>;
 

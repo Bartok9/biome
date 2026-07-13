@@ -9,7 +9,8 @@ use biome_languages::DocumentFileSource;
 use biome_languages::LanguageDb;
 #[cfg(feature = "module_graph")]
 use biome_module_graph::{
-    LocalTypeId, ModuleDb, ModuleInfo, ModuleInfoKind, ModuleInfoOrigin, ModuleKey, TypeDb,
+    LocalTypeId, ModuleDb, ModuleGraphGeneration, ModuleInfo, ModuleInfoKind, ModuleInfoOrigin,
+    ModuleKey, TypeDb,
 };
 use biome_parser::AnyParse;
 use biome_rowan::SendNode;
@@ -33,7 +34,7 @@ pub enum ParsedSourceUpdateMode {
 ///
 /// All data stored in the database must be clonable and must support [Sync] and [Send].
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WorkspaceDb {
     /// It maps a file path to its corresponding parsed version.
     files: Arc<HashMap<Utf8PathBuf, ParsedSource>>,
@@ -44,6 +45,21 @@ pub struct WorkspaceDb {
     file_sources: Arc<boxcar::Vec<DocumentFileSource>>,
     // NOTE: this must stay last as per salsa restrictions.
     storage: Storage<Self>,
+}
+
+impl Default for WorkspaceDb {
+    fn default() -> Self {
+        let db = Self {
+            files: Arc::default(),
+            #[cfg(feature = "module_graph")]
+            modules: Arc::default(),
+            file_sources: Arc::default(),
+            storage: Storage::default(),
+        };
+        #[cfg(feature = "module_graph")]
+        ModuleGraphGeneration::new(&db, 0);
+        db
+    }
 }
 
 /// Handles to the collections that a [WorkspaceDb] shares with all its
@@ -60,9 +76,9 @@ pub struct WorkspaceDb {
 /// runs. This type is what makes that possible.
 #[derive(Clone)]
 pub struct WorkspaceDbData {
+    file_sources: Arc<boxcar::Vec<DocumentFileSource>>,
     #[cfg(feature = "module_graph")]
     modules: Arc<HashMap<Utf8PathBuf, ModuleInfo>>,
-    file_sources: Arc<boxcar::Vec<DocumentFileSource>>,
 }
 
 impl WorkspaceDbData {
@@ -80,57 +96,27 @@ impl WorkspaceDbData {
             )
     }
 
-    /// Checks whether the shared module map currently contains `path`.
-    ///
-    /// Use this for decisions such as skipping a file the scanner has already
-    /// indexed.
-    ///
-    /// Do not use this inside a Salsa query or before reading module contents.
-    /// Use [`ModuleDb::module_for_path`] instead so Salsa reruns the query when
-    /// the module graph changes.
     #[cfg(feature = "module_graph")]
     pub fn contains_module_untracked(&self, path: &Utf8Path) -> bool {
         self.modules.pin().contains_key(path)
     }
-
-    #[cfg(feature = "module_graph")]
-    pub fn insert_module(&self, path: Utf8PathBuf, module: ModuleInfo) {
-        self.modules.pin().insert(path, module);
-    }
-
-    #[cfg(feature = "module_graph")]
-    pub fn remove_module(&self, path: &Utf8Path) {
-        self.modules.pin().remove(path);
-    }
-
-    /// Removes all modules that start with the given path. That's usually used
-    /// when removing a library or a folder from the project.
-    pub fn unload_path(&self, path: &Utf8Path) {
-        #[cfg(feature = "module_graph")]
-        {
-            let modules = self.modules.pin();
-            let to_remove: Vec<Utf8PathBuf> = modules
-                .keys()
-                .filter(|p| p.starts_with(path))
-                .cloned()
-                .collect();
-            for p in to_remove {
-                modules.remove(&p);
-            }
-        }
-        #[cfg(not(feature = "module_graph"))]
-        let _ = path;
-    }
 }
 
 impl WorkspaceDb {
+    #[cfg(feature = "module_graph")]
+    fn bump_module_graph_generation(&mut self) {
+        let generation = ModuleGraphGeneration::get(self);
+        let next = generation.value(self).wrapping_add(1);
+        generation.set_value(self).to(next);
+    }
+
     /// Returns handles to the collections that this database shares with all
     /// its clones.
     pub fn data(&self) -> WorkspaceDbData {
         WorkspaceDbData {
+            file_sources: self.file_sources.clone(),
             #[cfg(feature = "module_graph")]
             modules: self.modules.clone(),
-            file_sources: self.file_sources.clone(),
         }
     }
 
@@ -231,21 +217,6 @@ impl WorkspaceDb {
         self.files.pin().get(path).copied()
     }
 
-    /// Removes all modules that start with the given path. That's usually used when removing a library or a
-    /// folder from the project.
-    #[cfg(feature = "module_graph")]
-    pub fn unload_path_from_module(&self, path: &Utf8Path) {
-        let modules = self.modules.pin();
-        let to_remove: Vec<Utf8PathBuf> = modules
-            .keys()
-            .filter(|p| p.starts_with(path))
-            .cloned()
-            .collect();
-        for p in to_remove {
-            modules.remove(&p);
-        }
-    }
-
     /// Returns a [Rc] to itself, cast to [ModuleDb]. This is used to send the service
     /// to the analyzer.
     #[cfg(feature = "module_graph")]
@@ -260,13 +231,14 @@ impl WorkspaceDb {
     }
 
     #[cfg(feature = "module_graph")]
-    pub fn insert_module(&self, path: Utf8PathBuf, module: ModuleInfo) {
+    pub fn insert_module(&mut self, path: Utf8PathBuf, module: ModuleInfo) {
         assert_eq!(
             module.origin(self),
             ModuleInfoOrigin::Published,
             "detached modules must not be inserted into the shared module registry"
         );
-        self.data().insert_module(path, module);
+        self.modules.pin().insert(path, module);
+        self.bump_module_graph_generation();
     }
 
     #[cfg(feature = "module_graph")]
@@ -319,12 +291,31 @@ impl WorkspaceDb {
     }
 
     #[cfg(feature = "module_graph")]
-    pub fn remove_module(&self, path: &Utf8Path) {
-        self.data().remove_module(path);
+    pub fn remove_module(&mut self, path: &Utf8Path) {
+        if self.modules.pin().remove(path).is_some() {
+            self.bump_module_graph_generation();
+        }
     }
 
-    pub fn unload_path(&self, path: &Utf8Path) {
-        self.data().unload_path(path);
+    pub fn unload_path(&mut self, path: &Utf8Path) {
+        #[cfg(feature = "module_graph")]
+        {
+            let modules = self.modules.pin();
+            let to_remove = modules
+                .keys()
+                .filter(|module_path| module_path.starts_with(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            for module_path in &to_remove {
+                modules.remove(module_path);
+            }
+            drop(modules);
+            if !to_remove.is_empty() {
+                self.bump_module_graph_generation();
+            }
+        }
+        #[cfg(not(feature = "module_graph"))]
+        let _ = path;
     }
 }
 
@@ -332,13 +323,32 @@ impl WorkspaceDb {
 ///
 /// This type contains no Salsa local state. Each call to [Self::fork] creates a
 /// database value with fresh Salsa local state and shared workspace data.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SharedWorkspaceDb {
     files: Arc<HashMap<Utf8PathBuf, ParsedSource>>,
     #[cfg(feature = "module_graph")]
     modules: Arc<HashMap<Utf8PathBuf, ModuleInfo>>,
     file_sources: Arc<boxcar::Vec<DocumentFileSource>>,
     storage: salsa::StorageHandle<WorkspaceDb>,
+}
+
+impl Default for SharedWorkspaceDb {
+    fn default() -> Self {
+        let WorkspaceDb {
+            files,
+            #[cfg(feature = "module_graph")]
+            modules,
+            file_sources,
+            storage,
+        } = WorkspaceDb::default();
+        Self {
+            files,
+            #[cfg(feature = "module_graph")]
+            modules,
+            file_sources,
+            storage: storage.into_zalsa_handle(),
+        }
+    }
 }
 
 impl SharedWorkspaceDb {
@@ -389,11 +399,17 @@ impl TypeDb for WorkspaceDb {
 #[cfg(feature = "module_graph")]
 #[salsa::db]
 impl ModuleDb for WorkspaceDb {
+    fn module_graph_generation(&self) -> u64 {
+        ModuleGraphGeneration::get(self).value(self)
+    }
+
     fn module_for_path(&self, path: &Utf8Path) -> Option<ModuleInfo> {
+        let _ = self.module_graph_generation();
         self.get_module(path)
     }
 
     fn for_each_module(&self, f: &mut dyn FnMut(&Utf8Path, &ModuleInfoKind)) {
+        let _ = self.module_graph_generation();
         let modules = self.modules.pin();
         let iter = modules.iter();
         for (path, module_info) in iter {
