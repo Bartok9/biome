@@ -1,7 +1,7 @@
 use super::{InferredModuleTypes, collected_type_result};
 use crate::ModuleDb;
 use crate::db::queries::infer_module_types;
-use crate::module_graph::ModuleInfo;
+use crate::module_graph::{ModuleInfo, ModuleInfoOrigin};
 use biome_js_type_info::interned_types::{
     Literal as InferredLiteral, LocalTypeHandle, ModuleKey, ReturnType as InferredReturnType,
     TypeData as InferredTypeData, TypeMember as InferredTypeMember,
@@ -495,6 +495,9 @@ pub(in crate::db::type_inference) fn module_for_key(
     module_key: ModuleKey,
 ) -> Option<ModuleInfo> {
     let module = ModuleInfo::from_id(module_key.as_id());
+    if module.origin(db) == ModuleInfoOrigin::Detached {
+        return Some(module);
+    }
     let current = db.module_for_path(module.path(db))?;
     (ModuleKey::new(current.as_id()) == module_key).then_some(current)
 }

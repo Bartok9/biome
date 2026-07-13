@@ -23,9 +23,10 @@ use biome_json_parser::{JsonParserOptions, parse_json};
 use biome_languages::JsFileSource;
 use biome_module_graph::{
     CallExpressionTypeInput, InferredModuleTypes, JsExport, JsOwnExport, ModuleDb, ModuleInfo,
-    ModuleInfoKind, NormalizeTypeInput, PathInfoCache,
+    ModuleInfoKind, ModuleInfoOrigin, NormalizeTypeInput, PathInfoCache,
     infer_call_expression_type as infer_call_expression_type_query, infer_module_types,
-    infer_module_types_bottom_up, normalize_type as normalize_type_query, resolve_js_module,
+    infer_module_types_bottom_up, module_for_key, normalize_type as normalize_type_query,
+    resolve_js_module,
 };
 use biome_package::{Dependencies, PackageJson};
 use biome_project_layout::ProjectLayout;
@@ -40,6 +41,31 @@ struct TestModuleDb {
     modules: BTreeMap<Utf8PathBuf, ModuleInfo>,
     events: Events,
     storage: Storage<Self>,
+}
+
+#[test]
+fn test_detached_module_keys_bypass_the_published_registry() {
+    let fs = MemoryFileSystem::default();
+    fs.insert("/src/index.ts".into(), "export const value = 1;");
+
+    let mut db = build_js_test_module_db(&fs, &["/src/index.ts"], true);
+    let path = Utf8PathBuf::from("/src/index.ts");
+    let published = db.module_for_path(&path).expect("module must exist");
+    let kind = published.kind(&db).clone();
+    let detached = ModuleInfo::new_detached(&db, path.clone(), kind.clone());
+
+    assert_eq!(detached.origin(&db), ModuleInfoOrigin::Detached);
+    assert_eq!(
+        module_for_key(&db, InferredModuleKey::new(detached.as_id())),
+        Some(detached)
+    );
+
+    let replacement = ModuleInfo::new_published(&db, path.clone(), kind);
+    db.modules.insert(path, replacement);
+    assert!(
+        module_for_key(&db, InferredModuleKey::new(published.as_id())).is_none(),
+        "stale published handles must be rejected"
+    );
 }
 
 #[test]
@@ -804,7 +830,7 @@ fn build_js_test_module_db_with_layout(
 ) -> TestModuleDb {
     let mut db = TestModuleDb::new();
     for path in paths {
-        let module_info = ModuleInfo::new(
+        let module_info = ModuleInfo::new_published(
             &db,
             Utf8PathBuf::from(*path),
             resolve_js_module_kind_with_layout(fs, project_layout, path, infer_types),

@@ -88,7 +88,7 @@ fn bench_index_d_ts_salsa_end_to_end(bencher: Bencher, name: &str) {
             );
 
             let db = WorkspaceDb::default();
-            let module = ModuleInfo::new(
+            let module = ModuleInfo::new_published(
                 &db,
                 path.as_path().to_path_buf(),
                 ModuleInfoKind::Js(module_info),
@@ -184,7 +184,7 @@ fn bench_index_d_ts_salsa_incremental_first_run(bencher: Bencher) {
                     &PathInfoCache::default(),
                     TypeInferenceMode::RawTypesOnly,
                 );
-                let module = ModuleInfo::new(
+                let module = ModuleInfo::new_published(
                     &db,
                     path.as_path().to_path_buf(),
                     ModuleInfoKind::Js(module_info),
@@ -228,7 +228,7 @@ fn bench_index_d_ts_salsa_incremental(bencher: Bencher) {
                     &PathInfoCache::default(),
                     TypeInferenceMode::RawTypesOnly,
                 );
-                let module = ModuleInfo::new(
+                let module = ModuleInfo::new_published(
                     &db,
                     path.as_path().to_path_buf(),
                     ModuleInfoKind::Js(module_info),
@@ -294,7 +294,7 @@ fn build_inferred_db(name: &str) -> (WorkspaceDb, ModuleInfo, ModuleInfoKind) {
 
     let kind = ModuleInfoKind::Js(module_info);
     let db = WorkspaceDb::default();
-    let module = ModuleInfo::new(&db, path.as_path().to_path_buf(), kind.clone());
+    let module = ModuleInfo::new_published(&db, path.as_path().to_path_buf(), kind.clone());
     db.modules
         .pin()
         .insert(path.as_path().to_path_buf(), module);

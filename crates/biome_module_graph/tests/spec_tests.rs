@@ -61,7 +61,7 @@ fn build_js_db(
             &path_info_cache,
             infer_types,
         );
-        let md = ModuleInfo::new(
+        let md = ModuleInfo::new_published(
             &db,
             path.as_path().to_path_buf(),
             ModuleInfoKind::Js(module_info),
@@ -91,7 +91,7 @@ fn build_html_db(
             layout,
             &path_info_cache,
         );
-        let md = ModuleInfo::new(
+        let md = ModuleInfo::new_published(
             &db,
             path.as_path().to_path_buf(),
             ModuleInfoKind::Html(module_info),
@@ -119,7 +119,7 @@ fn add_js_modules(
             &path_info_cache,
             infer_types,
         );
-        let md = ModuleInfo::new(
+        let md = ModuleInfo::new_published(
             db,
             path.as_path().to_path_buf(),
             ModuleInfoKind::Js(module_info),
@@ -138,7 +138,7 @@ fn add_css_modules(
     for (path, root) in css_roots {
         let (module_info, _, _) =
             resolve_css_module(root.clone(), path, fs, layout, &path_info_cache);
-        let md = ModuleInfo::new(
+        let md = ModuleInfo::new_published(
             db,
             path.as_path().to_path_buf(),
             ModuleInfoKind::Css(module_info),
@@ -167,7 +167,7 @@ fn add_html_modules(
             layout,
             &path_info_cache,
         );
-        let md = ModuleInfo::new(
+        let md = ModuleInfo::new_published(
             db,
             path.as_path().to_path_buf(),
             ModuleInfoKind::Html(module_info),

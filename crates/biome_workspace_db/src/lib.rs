@@ -8,7 +8,9 @@ use biome_db::{ParsedSnippet, ParsedSource};
 use biome_languages::DocumentFileSource;
 use biome_languages::LanguageDb;
 #[cfg(feature = "module_graph")]
-use biome_module_graph::{LocalTypeId, ModuleDb, ModuleInfo, ModuleInfoKind, ModuleKey, TypeDb};
+use biome_module_graph::{
+    LocalTypeId, ModuleDb, ModuleInfo, ModuleInfoKind, ModuleInfoOrigin, ModuleKey, TypeDb,
+};
 use biome_parser::AnyParse;
 use biome_rowan::SendNode;
 #[cfg(feature = "module_graph")]
@@ -259,6 +261,11 @@ impl WorkspaceDb {
 
     #[cfg(feature = "module_graph")]
     pub fn insert_module(&self, path: Utf8PathBuf, module: ModuleInfo) {
+        assert_eq!(
+            module.origin(self),
+            ModuleInfoOrigin::Published,
+            "detached modules must not be inserted into the shared module registry"
+        );
         self.data().insert_module(path, module);
     }
 
@@ -274,7 +281,7 @@ impl WorkspaceDb {
             existing_module.set_kind(self).to(kind);
             existing_module
         } else {
-            let module = ModuleInfo::new(self, path.clone(), kind);
+            let module = ModuleInfo::new_published(self, path.clone(), kind);
             self.insert_module(path, module);
             module
         }
@@ -361,6 +368,12 @@ impl biome_db::Db for WorkspaceDb {
 impl TypeDb for WorkspaceDb {
     fn local_type_name(&self, module_key: ModuleKey, type_id: LocalTypeId) -> Option<Text> {
         let module = ModuleInfo::from_id(module_key.as_id());
+        if module.origin(self) == ModuleInfoOrigin::Detached {
+            let ModuleInfoKind::Js(info) = module.kind(self) else {
+                return None;
+            };
+            return info.local_type_name(type_id);
+        }
         let current = self.module_for_path(module.path(self))?;
         if ModuleKey::new(current.as_id()) != module_key {
             return None;

@@ -118,7 +118,7 @@ impl AnalyzerServicesBuilder {
                 &path_info_cache,
                 true,
             );
-            let md = biome_module_graph::ModuleInfo::new(
+            let md = biome_module_graph::ModuleInfo::new_published(
                 &db,
                 path.as_path().to_path_buf(),
                 ModuleInfoKind::Js(module_info),
@@ -130,7 +130,7 @@ impl AnalyzerServicesBuilder {
         for (path, root) in css_added_paths {
             let (module_info, _, _) =
                 resolve_css_module(root, path, &fs, &layout, &path_info_cache);
-            let md = biome_module_graph::ModuleInfo::new(
+            let md = biome_module_graph::ModuleInfo::new_published(
                 &db,
                 path.as_path().to_path_buf(),
                 ModuleInfoKind::Css(module_info),
@@ -148,7 +148,7 @@ impl AnalyzerServicesBuilder {
                 &layout,
                 &path_info_cache,
             );
-            let md = biome_module_graph::ModuleInfo::new(
+            let md = biome_module_graph::ModuleInfo::new_published(
                 &db,
                 path.as_path().to_path_buf(),
                 ModuleInfoKind::Html(module_info),

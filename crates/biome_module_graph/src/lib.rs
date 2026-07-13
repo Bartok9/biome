@@ -23,7 +23,7 @@ pub use css_module_info::{
     ImportTreeDisplay, ImportTreeNode,
 };
 pub use db::queries::*;
-pub use db::{ModuleDb, TypeDb};
+pub use db::{ModuleDb, TypeDb, module_for_key};
 pub use diagnostics::ModuleDiagnostic;
 pub use html_module_info::{HtmlEmbeddedContent, HtmlModuleInfo, SerializedHtmlModuleInfo};
 pub use js_module_info::{
@@ -32,8 +32,8 @@ pub use js_module_info::{
     TypeInferenceMode,
 };
 pub use module_graph::{
-    ModuleDependencies, ModuleInfo, ModuleInfoKind, SUPPORTED_EXTENSIONS, SerializedModuleInfo,
-    resolve_css_module, resolve_html_module, resolve_js_module,
+    ModuleDependencies, ModuleInfo, ModuleInfoKind, ModuleInfoOrigin, SUPPORTED_EXTENSIONS,
+    SerializedModuleInfo, resolve_css_module, resolve_html_module, resolve_js_module,
     resolve_js_module_with_inference_mode,
 };
 pub use path_info_cache::PathInfoCache;
