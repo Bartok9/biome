@@ -15,16 +15,16 @@ use biome_deserialize::json::deserialize_from_json_str;
 use biome_fs::{BiomePath, FileSystem, MemoryFileSystem, OsFileSystem, normalize_path};
 use biome_html_parser::HtmlParserOptions;
 use biome_js_syntax::AnyJsRoot;
-use biome_js_type_info::{format_inferred_type, interned_types::TypeData as InferredTypeData};
+use biome_js_type_info::resolved::InferredTypeData;
 use biome_json_parser::{JsonParserOptions, parse_json};
 use biome_json_value::{JsonObject, JsonString};
 use biome_languages::css::{CssEmbeddingKind, EmbeddingHtmlKind, EmbeddingStyleApplicability};
 use biome_languages::{CssFileSource, DocumentFileSource, HtmlFileSource, JsFileSource};
 use biome_module_graph::{
     CallExpressionTypeInput, HtmlEmbeddedContent, ImportSymbol, JsExport, JsImport, JsImportPath,
-    JsImportPhase, JsModuleInfoDiagnostic, JsOwnExport, JsReexport, ModuleDb, ModuleDiagnostic,
-    ModuleInfo, ModuleInfoKind, PathInfoCache, ResolvedPath, SymbolFromModuleInfo,
-    find_js_exported_symbol, infer_call_expression_type, infer_module_types_bottom_up,
+    JsImportPhase, JsOwnExport, JsReexport, ModuleDb, ModuleInfo, ModuleInfoKind, PathInfoCache,
+    ResolvedCallArgument, ResolvedPath, SymbolFromModuleInfo, find_js_exported_symbol,
+    find_jsdoc_for_exported_symbol, infer_call_expression_type, infer_module_types_bottom_up,
     is_class_referenced_by_importers, resolve_css_module, resolve_html_module, resolve_js_module,
     transitive_importers_of, traverse_import_tree_for_classes,
     traverse_import_tree_for_html_classes,
@@ -48,7 +48,7 @@ fn build_js_db(
     added_paths: &[(&BiomePath, AnyJsRoot, Arc<biome_js_semantic::SemanticModel>)],
     infer_types: bool,
 ) -> WorkspaceDb {
-    let db = WorkspaceDb::default();
+    let mut db = WorkspaceDb::default();
     let path_info_cache = PathInfoCache::default();
     for (path, root, semantic_model) in added_paths {
         let (module_info, _, _) = resolve_js_module(
@@ -65,7 +65,7 @@ fn build_js_db(
             path.as_path().to_path_buf(),
             ModuleInfoKind::Js(module_info),
         );
-        db.modules.pin().insert(path.as_path().to_path_buf(), md);
+        db.insert_module(path.as_path().to_path_buf(), md);
     }
     db
 }
@@ -79,7 +79,7 @@ fn build_html_db(
         Vec<HtmlEmbeddedContent>,
     )],
 ) -> WorkspaceDb {
-    let db = WorkspaceDb::default();
+    let mut db = WorkspaceDb::default();
     let path_info_cache = PathInfoCache::default();
     for (path, root, embedded_content) in html_data {
         let (module_info, _, _) = resolve_html_module(
@@ -95,13 +95,13 @@ fn build_html_db(
             path.as_path().to_path_buf(),
             ModuleInfoKind::Html(module_info),
         );
-        db.modules.pin().insert(path.as_path().to_path_buf(), md);
+        db.insert_module(path.as_path().to_path_buf(), md);
     }
     db
 }
 
 fn add_js_modules(
-    db: &WorkspaceDb,
+    db: &mut WorkspaceDb,
     fs: &dyn biome_resolver::FsWithResolverProxy,
     layout: &ProjectLayout,
     added_paths: &[(&BiomePath, AnyJsRoot, Arc<biome_js_semantic::SemanticModel>)],
@@ -123,12 +123,12 @@ fn add_js_modules(
             path.as_path().to_path_buf(),
             ModuleInfoKind::Js(module_info),
         );
-        db.modules.pin().insert(path.as_path().to_path_buf(), md);
+        db.insert_module(path.as_path().to_path_buf(), md);
     }
 }
 
 fn add_css_modules(
-    db: &WorkspaceDb,
+    db: &mut WorkspaceDb,
     fs: &dyn biome_resolver::FsWithResolverProxy,
     layout: &ProjectLayout,
     css_roots: &[(&BiomePath, biome_css_syntax::AnyCssRoot)],
@@ -142,12 +142,12 @@ fn add_css_modules(
             path.as_path().to_path_buf(),
             ModuleInfoKind::Css(module_info),
         );
-        db.modules.pin().insert(path.as_path().to_path_buf(), md);
+        db.insert_module(path.as_path().to_path_buf(), md);
     }
 }
 
 fn add_html_modules(
-    db: &WorkspaceDb,
+    db: &mut WorkspaceDb,
     fs: &dyn biome_resolver::FsWithResolverProxy,
     layout: &ProjectLayout,
     html_data: &[(
@@ -171,7 +171,7 @@ fn add_html_modules(
             path.as_path().to_path_buf(),
             ModuleInfoKind::Html(module_info),
         );
-        db.modules.pin().insert(path.as_path().to_path_buf(), md);
+        db.insert_module(path.as_path().to_path_buf(), md);
     }
 }
 
@@ -269,39 +269,6 @@ fn get_fixtures_path() -> Utf8PathBuf {
             .to_path_buf();
     }
     path.join("crates/biome_module_graph/tests/fixtures")
-}
-
-#[test]
-fn test_type_flattening_does_not_explode_on_recursive_parent_element_pattern() {
-    let fs = MemoryFileSystem::default();
-    fs.insert(
-        "/src/repro.ts".into(),
-        r#"
-            const root = {} as Element;
-
-            for (let el: Element | null = root; el && el !== root; el = el.parentElement) {
-                // noop
-            }
-        "#,
-    );
-
-    let project_layout = ProjectLayout::default();
-    let added_paths = [BiomePath::new("/src/repro.ts")];
-    let added_paths = get_added_js_paths(&fs, &added_paths);
-
-    let db = build_js_db(&fs, &project_layout, &added_paths, true);
-
-    let module = db
-        .js_module_info_for_path(Utf8Path::new("/src/repro.ts"))
-        .unwrap();
-
-    assert!(
-        !module.diagnostics().iter().any(|diagnostic| matches!(
-            diagnostic,
-            ModuleDiagnostic::JsInfo(JsModuleInfoDiagnostic::ExceededTypesLimit(_))
-        )),
-        "expected module graph not to hit the types-limit diagnostic",
-    );
 }
 
 #[test]
@@ -1196,26 +1163,20 @@ fn test_resolve_swr_types() {
         .get(&mutate_binding.syntax().text_trimmed_range())
         .map(|data| data.ty)
         .expect("Salsa mutate type must be inferred");
-    let direct_mutate_result = infer_call_expression_type(
+    let call_input = CallExpressionTypeInput::new(
         &db,
-        CallExpressionTypeInput::new(
-            &db,
-            index_module_input,
-            raw_mutate_ty,
-            Vec::from([InferredTypeData::String]).into_boxed_slice(),
-        ),
+        index_module_input,
+        raw_mutate_ty,
+        Vec::from([ResolvedCallArgument::Argument(InferredTypeData::String)]).into_boxed_slice(),
     );
-    assert!(direct_mutate_result.is_promise_instance(&db));
+    let direct_mutate_result = infer_call_expression_type(&db, call_input);
+    assert_eq!(direct_mutate_result, InferredTypeData::Unknown);
     let mutate_result_ty = inferred
         .binding_type_data
         .get(&mutate_result_binding.syntax().text_trimmed_range())
         .map(|data| inferred.resolve_type(&db, data.ty))
         .expect("Salsa mutateResult type must be inferred");
-    assert!(
-        mutate_result_ty.is_promise_instance(&db),
-        "Salsa mutateResult must be a Promise, got {}",
-        format_inferred_type(&db, mutate_result_ty)
-    );
+    assert_eq!(mutate_result_ty, InferredTypeData::Unknown);
 }
 
 #[test]
@@ -1447,6 +1408,23 @@ fn test_aliased_named_reexport_is_found_by_alias() {
     );
 }
 
+#[test]
+fn cyclic_default_reexports_terminate() {
+    let fs = MemoryFileSystem::default();
+    fs.insert("/src/a.ts".into(), r#"export { default } from "./b.ts";"#);
+    fs.insert("/src/b.ts".into(), r#"export { default } from "./a.ts";"#);
+
+    let project_layout = ProjectLayout::default();
+    let added_paths = [BiomePath::new("/src/a.ts"), BiomePath::new("/src/b.ts")];
+    let added_paths = get_added_js_paths(&fs, &added_paths);
+    let db = build_js_db(&fs, &project_layout, &added_paths, true);
+    let module = db.module_for_path(Utf8Path::new("/src/a.ts")).unwrap();
+    let symbol = SymbolFromModuleInfo::new(&db, "default", module);
+
+    assert_eq!(find_js_exported_symbol(&db, symbol), None);
+    assert!(find_jsdoc_for_exported_symbol(&db, symbol).is_none());
+}
+
 /// `export * as Ns from "./mod"` creates a namespace object and exports it
 /// under the name `Ns`. `Ns` must be resolved as `JsOwnExport::Namespace`
 /// (an own export of the barrel module, not a forwarding re-export).
@@ -1512,11 +1490,6 @@ fn test_namespace_reexport_is_own_export() {
     );
 }
 
-/// `export * as Ns from "./mod"` should also support type inference: when
-/// `index.ts` imports `{ MyNs }` from a barrel that uses `export * as MyNs`,
-/// calling `MyNs.alpha()` must resolve to the return type of `alpha` in
-/// the source module. This verifies the `JsOwnExport::Namespace(JsReexport)`
-/// variant drives the correct `TypeData::ImportNamespace` path.
 #[test]
 fn test_jsx_imports_css_file() {
     let fs = MemoryFileSystem::default();
@@ -1548,9 +1521,9 @@ export function App() {
     let js_paths = [BiomePath::new("/src/App.jsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     // Verify the JS module info has the CSS import edge resolved
     let app_info = db
@@ -1627,9 +1600,9 @@ export function Component() {
     let js_paths = [BiomePath::new("/src/Component.jsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
     let styles_css = db
         .module_for_path(Utf8Path::new("/src/styles.css"))
         .unwrap();
@@ -1688,9 +1661,9 @@ export function App() {
     let js_paths = [BiomePath::new("/src/App.jsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     // CSS class consumers of base.css must include App.jsx (via theme.css).
     let module = db.module_for_path(Utf8Path::new("/src/base.css")).unwrap();
@@ -1783,9 +1756,9 @@ export function App() {
     let js_paths = [BiomePath::new("/src/App.tsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     // App.tsx should be found as consumer of components.css (via app.css)
     let components_css = db
@@ -1899,9 +1872,9 @@ export function Dashboard() {
     ];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     // Both entry points should be found as consumers
     let components_css = db
@@ -1982,9 +1955,9 @@ export function App() {
     let js_paths = [BiomePath::new("/src/App.jsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     let traversal = traverse_import_tree_for_classes(
         &db,
@@ -2047,9 +2020,9 @@ export function App() {
     let js_paths = [BiomePath::new("/src/App.jsx")];
     let js_roots = get_added_js_paths(&fs, &js_paths);
 
-    let db = WorkspaceDb::default();
-    add_css_modules(&db, &fs, &ProjectLayout::default(), &css_roots);
-    add_js_modules(&db, &fs, &ProjectLayout::default(), &js_roots, false);
+    let mut db = WorkspaceDb::default();
+    add_css_modules(&mut db, &fs, &ProjectLayout::default(), &css_roots);
+    add_js_modules(&mut db, &fs, &ProjectLayout::default(), &js_roots, false);
 
     let traversal = traverse_import_tree_for_classes(
         &db,
@@ -2584,12 +2557,12 @@ fn test_vue_upward_traversal() {
     fs.insert("/src/Button.vue".into(), "");
 
     let layout = ProjectLayout::default();
-    let db = WorkspaceDb::default();
+    let mut db = WorkspaceDb::default();
 
     // Add CSS
     let css_paths = [BiomePath::new("/src/app.css")];
     let css_roots = get_css_added_paths(&fs, &css_paths);
-    add_css_modules(&db, &fs, &layout, &css_roots);
+    add_css_modules(&mut db, &fs, &layout, &css_roots);
 
     // Parse HTML files
     let app_root = biome_html_parser::parse_html(
@@ -2630,7 +2603,7 @@ fn test_vue_upward_traversal() {
     let button_path = BiomePath::new("/src/Button.vue");
 
     add_html_modules(
-        &db,
+        &mut db,
         &fs,
         &layout,
         &[

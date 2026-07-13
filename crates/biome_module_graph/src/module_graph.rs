@@ -187,9 +187,19 @@ impl ModuleInfo {
     }
 }
 
+/// Describes whether a module is shared or belongs to one request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModuleInfoOrigin {
+    /// A module stored in the shared module registry. Salsa queries may reuse
+    /// results that were computed from this module.
     Published,
+    /// A module built from changed content for one request.
+    ///
+    /// Detached modules must never enter the shared module registry. If they
+    /// did, a reused Salsa result could contain content from another request. A
+    /// detached module is never replaced through that registry, so
+    /// [`module_for_key`](crate::module_for_key) does not need to check whether
+    /// its key still points to the current module for that path.
     Detached,
 }
 

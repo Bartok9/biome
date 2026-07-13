@@ -1,53 +1,65 @@
+//! Read-only, lint-facing queries over database-backed inferred types.
+//!
+//! Fallible predicates return `None` when resolution, cycles, or traversal
+//! limits prevent a reliable answer. Boolean-only queries use conservative
+//! fallbacks that suppress diagnostics when inference is incomplete.
+
 use crate::TypeDb;
-use crate::interned_types::{
-    ConditionalType, Literal, ReturnType, TypeData, TypeMember, TypeMemberKind,
-};
+use crate::interned_types::{ConditionalType, Literal, ReturnType, TypeData, TypeMember};
+use crate::return_type_relation::{ReturnTypeRelation, is_escape_hatch, promise_inner};
 use biome_rowan::Text;
 use rustc_hash::FxHashSet;
+use std::collections::VecDeque;
 
 const MAX_TYPE_VARIANT_STEPS: usize = 1024;
+const MAX_TYPE_VARIANT_DEPTH: usize = 50;
+const MAX_TYPE_RELATION_DEPTH: usize = 50;
+const MAX_PROMISE_TYPE_STEPS: usize = 64;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// A case-relevant representation extracted from an inferred switch discriminant.
 pub enum InferredSwitchCase {
+    /// The broad `boolean` type.
     Boolean,
+    /// A specific boolean literal.
     BooleanLiteral(bool),
+    /// Bigint source text in canonical decimal notation when conversion succeeds.
     BigInt(Text),
+    /// The stored source text of a number literal.
     Number(Text),
+    /// String-literal text without delimiters.
     String(Text),
+    /// The `null` value.
     Null,
+    /// The `undefined` value.
     Undefined,
+    /// The broad `symbol` type.
     Symbol,
+    /// A literal that cannot become an emitted switch case.
     UnsupportedLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The JavaScript operation for which stringification is classified.
 pub enum StringificationMode {
+    /// Element stringification performed by an array or tuple `join` operation.
     Join,
+    /// Direct or implicit conversion of a value to a string.
     ToString,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether possible values have an intentional string representation.
 pub enum StringificationUsefulness {
+    /// Every value stringifies usefully, or uncertainty suppresses a diagnostic.
     Always,
+    /// Some values stringify usefully and others use the base object representation.
     Sometimes,
+    /// Every value uses the base object representation.
     Never,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReturnTypeEvidence {
-    pub has_any_const: bool,
-    pub object_wide_casts: usize,
-    pub has_narrower_than_object: bool,
-    pub has_pinning_assertion: bool,
-    pub prefer_inferred_suggestion: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MisleadingReturnType {
-    pub suggestion: Option<String>,
-}
-
-/// A Salsa-backed type value returned by type inference.
+/// An opaque, copyable view of database-backed inferred type data.
 #[derive(Clone, Copy)]
 pub struct InferredType<'db> {
     db: &'db dyn TypeDb,
@@ -55,18 +67,36 @@ pub struct InferredType<'db> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Primitive families accepted by [`InferredType::nullish_union_matches_ignored_primitives`].
 pub struct IgnoredPrimitiveTypes {
+    /// Accept the broad string type and string literals.
     pub string: bool,
+    /// Accept the broad number type and number literals.
     pub number: bool,
+    /// Accept the broad boolean type and boolean literals.
     pub boolean: bool,
+    /// Accept the broad bigint type and bigint literals.
     pub bigint: bool,
 }
 
 impl<'db> InferredType<'db> {
+    /// Creates a query facade for `data` in `db`.
+    ///
+    /// Interned handles inside `data` must come from the same database. This
+    /// constructor does not validate, resolve, or normalize the supplied type.
+    ///
+    /// ```
+    /// use biome_js_type_info::{InferredType, TypeDb, resolved::InferredTypeData};
+    ///
+    /// fn number_type<'db>(db: &'db dyn TypeDb) -> InferredType<'db> {
+    ///     InferredType::new(db, InferredTypeData::Number)
+    /// }
+    /// ```
     pub const fn new(db: &'db dyn TypeDb, data: TypeData<'db>) -> Self {
         Self { db, data }
     }
 
+    /// Returns whether this is a number literal equal to `value`.
     pub fn is_number_literal(self, value: f64) -> bool {
         matches!(
             self.data,
@@ -75,6 +105,7 @@ impl<'db> InferredType<'db> {
         )
     }
 
+    /// Returns whether this is exactly the broad number type or a number literal.
     pub fn is_number_or_number_literal(self) -> bool {
         matches!(self.data, TypeData::Number)
             || matches!(
@@ -84,6 +115,7 @@ impl<'db> InferredType<'db> {
             )
     }
 
+    /// Returns whether this is a decimal bigint literal equal to `value`.
     pub fn is_bigint_literal(self, value: i64) -> bool {
         matches!(
             self.data,
@@ -92,6 +124,7 @@ impl<'db> InferredType<'db> {
         )
     }
 
+    /// Returns whether this is exactly the broad string type or a string literal.
     pub fn is_string_or_string_literal(self) -> bool {
         matches!(self.data, TypeData::String)
             || matches!(
@@ -101,8 +134,11 @@ impl<'db> InferredType<'db> {
             )
     }
 
+    /// Returns whether every reachable variant is string-like.
     pub fn is_all_string_like(self) -> bool {
-        self.all_variants_match(|data| {
+        // Exhaustion is conservative: every consumer treats `false` as "do not
+        // diagnose" (and therefore cannot offer a fix).
+        self.try_all_variants_match(|data| {
             matches!(data, TypeData::String)
                 || matches!(
                     data,
@@ -110,10 +146,12 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::String(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether every reachable variant is number-like.
     pub fn is_all_number_like(self) -> bool {
-        self.all_variants_match(|data| {
+        self.try_all_variants_match(|data| {
             matches!(data, TypeData::Number)
                 || matches!(
                     data,
@@ -121,10 +159,12 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::Number(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether every reachable variant is boolean-like.
     pub fn is_all_boolean_like(self) -> bool {
-        self.all_variants_match(|data| {
+        self.try_all_variants_match(|data| {
             matches!(data, TypeData::Boolean)
                 || matches!(
                     data,
@@ -132,10 +172,12 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::Boolean(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether every reachable variant is bigint-like.
     pub fn is_all_bigint_like(self) -> bool {
-        self.all_variants_match(|data| {
+        self.try_all_variants_match(|data| {
             matches!(data, TypeData::BigInt)
                 || matches!(
                     data,
@@ -143,10 +185,12 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::BigInt(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether every reachable variant is an integer literal or bigint-like.
     pub fn is_all_integer_like(self) -> bool {
-        self.all_variants_match(|data| match data {
+        self.try_all_variants_match(|data| match data {
             TypeData::BigInt => true,
             TypeData::Literal(literal) => match literal.literal(self.db) {
                 Literal::BigInt(_) => true,
@@ -157,10 +201,12 @@ impl<'db> InferredType<'db> {
             },
             _ => false,
         })
+        .unwrap_or(false)
     }
 
-    pub fn is_all_string_array_or_tuple(self) -> bool {
-        self.all_variants_match(|data| {
+    /// Returns whether every variant is a string, tuple, or `Array` instance.
+    pub fn is_all_string_or_array_or_tuple(self) -> bool {
+        self.try_all_variants_match(|data| {
             matches!(data, TypeData::String | TypeData::Tuple(_))
                 || matches!(
                     data,
@@ -173,8 +219,10 @@ impl<'db> InferredType<'db> {
                         if instance.ty(self.db).is_array_class(self.db)
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether this is a regular-expression literal without the `g` flag.
     pub fn is_regexp_literal_without_global_flag(self) -> bool {
         matches!(
         self.data,
@@ -183,189 +231,160 @@ impl<'db> InferredType<'db> {
         )
     }
 
-    pub fn regexp_literal(self) -> Option<(Text, Text)> {
+    /// Returns the stored pattern and flags for a regular-expression literal.
+    pub fn regexp_literal(self) -> Option<(&'db Text, &'db Text)> {
         let TypeData::Literal(literal) = self.data else {
             return None;
         };
         let Literal::RegExp(regexp) = literal.literal(self.db) else {
             return None;
         };
-        Some((regexp.pattern.clone(), regexp.flags.clone()))
+        Some((&regexp.pattern, &regexp.flags))
     }
 
+    /// Returns whether this is directly an instance of the `Array` class.
     pub fn is_array(self) -> bool {
         matches!(self.data, TypeData::InstanceOf(instance) if instance.ty(self.db).is_array_class(self.db))
     }
 
-    pub fn is_array_of_promise(self) -> bool {
+    /// Returns whether this is an array whose element type reaches `Promise` or `PromiseLike`.
+    ///
+    /// `Some(true)` confirms a promise element, `Some(false)` confirms a known
+    /// nonmatching type, and `None` means missing or unresolved element data, a
+    /// cycle, or budget exhaustion prevented a reliable answer.
+    pub fn is_array_of_promise(self) -> Option<bool> {
         let TypeData::InstanceOf(instance) = self.data else {
-            return false;
+            return if is_indeterminate_type(self.data) {
+                None
+            } else {
+                Some(false)
+            };
         };
 
-        instance.ty(self.db).is_array_class(self.db)
-            && instance
-                .type_parameters(self.db)
-                .first()
-                .is_some_and(|ty| is_promise_instance(self.db, *ty))
+        if !instance.ty(self.db).is_array_class(self.db) {
+            return Some(false);
+        }
+        instance
+            .type_parameters(self.db)
+            .first()
+            .and_then(|ty| is_promise_instance(self.db, *ty))
     }
 
+    /// Returns whether a reachable type declares or inherits `Symbol.dispose`.
     pub fn is_disposable(self) -> bool {
         self.has_computed_member("Symbol.dispose")
     }
 
+    /// Returns whether a reachable type declares or inherits `Symbol.asyncDispose`.
     pub fn is_async_disposable(self) -> bool {
         self.has_computed_member("Symbol.asyncDispose")
     }
 
-    pub fn is_promise_instance(self) -> bool {
+    /// Searches this type and its reachable targets for `Promise` or `PromiseLike`.
+    ///
+    /// `Some(true)` confirms a promise target, `Some(false)` proves no target
+    /// exists, and `None` means unresolved data, a cycle, or budget exhaustion
+    /// prevented a reliable negative answer.
+    ///
+    /// ```
+    /// use biome_js_type_info::InferredType;
+    ///
+    /// fn should_report(ty: InferredType<'_>) -> bool {
+    ///     ty.is_promise_instance() == Some(true)
+    /// }
+    /// ```
+    pub fn is_promise_instance(self) -> Option<bool> {
         is_promise_instance(self.db, self.data)
     }
 
+    /// Returns whether this is directly represented as a callable function.
     pub fn is_function(self) -> bool {
         self.data.callable_function(self.db).is_some()
     }
 
+    /// Conservatively returns whether this type is at least as wide as `object`.
     pub fn is_at_least_as_wide_as_object(self) -> bool {
         is_at_least_as_wide_as_object(self.db, self.data, &mut FxHashSet::default(), 0)
     }
 
-    pub fn check_misleading_return_type(
-        self,
-        returns: &[Self],
-        evidence: ReturnTypeEvidence,
-        is_async: bool,
-    ) -> Option<MisleadingReturnType> {
-        let mut annotation = self.data;
-        if is_escape_hatch(annotation) {
-            return None;
-        }
-        if is_async {
-            annotation = promise_inner(self.db, annotation).unwrap_or(annotation);
-        }
-        annotation =
-            collapse_union_absorbed_by_primitive(self.db, annotation).unwrap_or(annotation);
-
-        let return_types = normalize_boolean_return_types(
-            self.db,
-            returns.iter().map(|ty| ty.data).collect::<Vec<_>>(),
-        );
-        if return_types.is_empty() {
-            return None;
-        }
-        if return_types.len() == 1
-            && !evidence.has_any_const
-            && !evidence.has_pinning_assertion
-            && is_literal_of_primitive(self.db, return_types[0])
-            && !matches!(annotation, TypeData::Union(_))
-        {
-            return None;
-        }
-        if !evidence.has_any_const
-            && evidence.object_wide_casts == return_types.len()
-            && matches!(annotation, TypeData::ObjectKeyword)
-        {
-            return None;
-        }
-        if matches!(annotation, TypeData::Boolean)
-            && return_types
-                .iter()
-                .any(|ty| ty.is_boolean_literal(self.db, true))
-            && return_types
-                .iter()
-                .any(|ty| ty.is_boolean_literal(self.db, false))
-        {
-            return None;
-        }
-        if return_types
-            .iter()
-            .any(|ty| is_any_contaminated(self.db, *ty))
-        {
-            return None;
-        }
-        if matches!(annotation, TypeData::Union(_))
-            && union_variants(self.db, annotation)
-                .iter()
-                .any(|ty| matches!(ty, TypeData::UnknownKeyword | TypeData::Unknown))
-        {
-            return None;
-        }
-        if includes_undefined(self.db, annotation)
-            && !return_types
-                .iter()
-                .any(|ty| includes_undefined(self.db, *ty))
-        {
-            return None;
-        }
-        if return_types
-            .iter()
-            .any(|ty| is_intersection_with_type_param(self.db, *ty))
-        {
-            return None;
-        }
-        if !evidence.has_any_const
-            && is_only_property_literal_widening(self.db, annotation, &return_types)
-        {
-            return None;
-        }
-
-        let is_misleading = if matches!(annotation, TypeData::Union(_)) {
-            is_union_wider_than_returns(self.db, annotation, &return_types)
-        } else if matches!(annotation, TypeData::ObjectKeyword) {
-            !return_types
-                .iter()
-                .any(|ty| includes_object_keyword(self.db, *ty))
-                && evidence.object_wide_casts == 0
-                && (evidence.has_narrower_than_object
-                    || return_types
-                        .iter()
-                        .any(|ty| is_wider_than(self.db, annotation, *ty)))
-        } else {
-            return_types
-                .iter()
-                .all(|ty| is_wider_than(self.db, annotation, *ty))
-        };
-        if !is_misleading {
-            return None;
-        }
-
-        let suggestion = if evidence.has_any_const || evidence.prefer_inferred_suggestion {
-            render_inferred(self.db, &return_types)
-        } else {
-            render_narrowed(self.db, annotation, &return_types)
-                .or_else(|| render_inferred(self.db, &return_types))
-        };
-        Some(MisleadingReturnType { suggestion })
+    /// Returns the first type argument of a directly represented `Promise<T>`.
+    pub fn promise_inner_type(self) -> Option<Self> {
+        promise_inner(self.db, self.data).map(|data| Self::new(self.db, data))
     }
 
-    pub fn function_returns_promise(self) -> bool {
+    /// Returns whether this declared return type prevents a useful comparison.
+    ///
+    /// An "escape hatch" is a declared type for which this check does not
+    /// compare returned values. This includes `any`, `unknown`, `void`, `never`,
+    /// `this`, and a type that inference could not resolve.
+    pub fn is_return_type_relation_escape_hatch(self) -> bool {
+        is_escape_hatch(self.data)
+    }
+
+    /// Compares this declared return type with inferred returned-value types.
+    ///
+    /// Boolean literal returns are normalized before comparison. Unresolved
+    /// data, cycles, or traversal limits produce an indeterminate verdict.
+    ///
+    /// ```
+    /// use biome_js_type_info::{InferredType, ReturnTypeVerdict};
+    ///
+    /// fn verdict<'db>(
+    ///     declared: InferredType<'db>,
+    ///     inferred: &[InferredType<'db>],
+    /// ) -> ReturnTypeVerdict {
+    ///     declared.compare_declared_return_type(inferred).verdict()
+    /// }
+    /// ```
+    pub fn compare_declared_return_type(self, inferred: &[Self]) -> ReturnTypeRelation<'db> {
+        let inferred = inferred.iter().map(|ty| ty.data).collect::<Vec<_>>();
+        crate::return_type_relation::compare_declared_return_type_owned(
+            self.db, self.data, inferred,
+        )
+    }
+
+    /// Returns whether this callable returns a `Promise` or `PromiseLike`.
+    ///
+    /// `Some(true)` confirms a promise return, `Some(false)` confirms a known
+    /// non-promise return or non-callable type, and `None` means unresolved data,
+    /// a cycle, or budget exhaustion prevented a reliable answer.
+    pub fn function_returns_promise(self) -> Option<bool> {
         let Some(function) = self.data.callable_function(self.db) else {
-            return false;
+            return if is_indeterminate_type(self.data) {
+                None
+            } else {
+                Some(false)
+            };
         };
         let ReturnType::Type(return_ty) = function.return_type(self.db) else {
-            return false;
+            return Some(false);
         };
-        contains_promise(self.db, *return_ty)
+        is_promise_instance(self.db, *return_ty)
     }
 
+    /// Returns whether this callable has an unresolved conditional return type.
     pub fn function_returns_conditional(self) -> bool {
         self.function_return_matches(|ty| matches!(ty, TypeData::Conditional))
     }
 
+    /// Returns whether this callable has an explicit `void` return type.
     pub fn function_returns_void(self) -> bool {
         self.function_return_matches(|ty| matches!(ty, TypeData::VoidKeyword))
     }
 
-    pub fn has_promise_variant(self) -> bool {
+    /// Returns whether a top-level union contains a `Promise` or `PromiseLike` variant.
+    ///
+    /// `Some(true)` confirms a promise variant, `Some(false)` confirms a known
+    /// nonmatching top-level type, and `None` means unresolved data, a cycle, or
+    /// budget exhaustion prevented a reliable negative answer.
+    pub fn has_promise_variant(self) -> Option<bool> {
         match self.data {
-            TypeData::Union(union) => union
-                .types(self.db)
-                .iter()
-                .any(|ty| is_promise_instance(self.db, *ty)),
-            _ => false,
+            TypeData::Union(_) => is_promise_instance(self.db, self.data),
+            _ => Some(false),
         }
     }
 
-    /// Returns whether the top-level type was successfully inferred.
+    /// Returns whether the top-level representation is usable inferred data.
     ///
     /// Internal `Unknown` variants poison unions in `UnionBuilder`, while the
     /// explicit TypeScript `unknown` keyword remains an inferred type.
@@ -379,24 +398,33 @@ impl<'db> InferredType<'db> {
         )
     }
 
+    /// Returns whether every reachable value is known to be truthy.
     pub fn is_always_truthy(self) -> bool {
         self.conditional_type().is_truthy()
     }
 
+    /// Returns whether every reachable value is known to be falsy.
     pub fn is_always_falsy(self) -> bool {
         self.conditional_type().is_falsy()
     }
 
+    /// Returns whether every reachable value is known to be non-nullish.
     pub fn is_non_nullish(self) -> bool {
         self.conditional_type().is_non_nullish()
     }
 
+    /// Returns whether every reachable value is known to be nullish.
     pub fn is_nullish(self) -> bool {
         self.conditional_type().is_nullish()
     }
 
-    pub fn has_nullish_variant(self) -> bool {
-        self.any_variant_matches(|data| {
+    /// Returns `Some(true)` when a reachable nullish variant is found.
+    ///
+    /// `Some(true)` confirms a nullish variant, `Some(false)` proves none exists,
+    /// and `None` means unresolved data, a cycle, or budget exhaustion prevented
+    /// a reliable negative answer.
+    pub fn has_nullish_variant(self) -> Option<bool> {
+        self.try_any_variant_matches(|data| {
             matches!(
                 data,
                 TypeData::Null | TypeData::Undefined | TypeData::VoidKeyword
@@ -404,8 +432,13 @@ impl<'db> InferredType<'db> {
         })
     }
 
-    pub fn is_safe_for_nullish_coalescing(self) -> bool {
-        self.all_variants_match(|data| {
+    /// Returns whether every variant makes `??` equivalent to `||`.
+    ///
+    /// `Some(true)` means every variant is safe, `Some(false)` identifies a known
+    /// counterexample, and `None` means unresolved data, a cycle, or budget
+    /// exhaustion prevented a reliable answer.
+    pub fn is_safe_for_nullish_coalescing(self) -> Option<bool> {
+        self.try_all_variants_match(|data| {
             if matches!(data, TypeData::InstanceOf(_)) {
                 return true;
             }
@@ -416,12 +449,31 @@ impl<'db> InferredType<'db> {
         })
     }
 
-    pub fn nullish_union_matches_ignored_primitives(self, ignored: IgnoredPrimitiveTypes) -> bool {
+    /// Returns whether a top-level union contains only nullish or enabled primitive variants.
+    ///
+    /// `Some(true)` means every variant is accepted, `Some(false)` identifies a
+    /// disallowed variant or non-union type, and `None` means unresolved data, a
+    /// cycle, or budget exhaustion prevented a reliable answer.
+    ///
+    /// ```
+    /// use biome_js_type_info::{IgnoredPrimitiveTypes, InferredType};
+    ///
+    /// fn accepts_nullish_or_string(ty: InferredType<'_>) -> Option<bool> {
+    ///     ty.nullish_union_matches_ignored_primitives(IgnoredPrimitiveTypes {
+    ///         string: true,
+    ///         ..IgnoredPrimitiveTypes::default()
+    ///     })
+    /// }
+    /// ```
+    pub fn nullish_union_matches_ignored_primitives(
+        self,
+        ignored: IgnoredPrimitiveTypes,
+    ) -> Option<bool> {
         let TypeData::Union(_) = self.data else {
-            return false;
+            return Some(false);
         };
 
-        self.all_variants_match(|data| match data {
+        self.try_all_variants_match(|data| match data {
             TypeData::Null | TypeData::Undefined | TypeData::VoidKeyword => true,
             TypeData::String => ignored.string,
             TypeData::Number => ignored.number,
@@ -438,16 +490,30 @@ impl<'db> InferredType<'db> {
         })
     }
 
-    pub fn has_null_variant(self) -> bool {
-        self.any_variant_matches(|data| matches!(data, TypeData::Null))
+    /// Returns whether the type contains `null`.
+    ///
+    /// `Some(true)` confirms a `null` variant, `Some(false)` proves none exists,
+    /// and `None` means unresolved data, a cycle, or budget exhaustion prevented
+    /// a reliable negative answer.
+    pub fn has_null_variant(self) -> Option<bool> {
+        self.try_any_variant_matches(|data| matches!(data, TypeData::Null))
     }
 
-    pub fn has_undefined_variant(self) -> bool {
-        self.any_variant_matches(|data| matches!(data, TypeData::Undefined | TypeData::VoidKeyword))
+    /// Returns whether the type contains `undefined` or `void`.
+    ///
+    /// `Some(true)` confirms an `undefined` or `void` variant, `Some(false)`
+    /// proves none exists, and `None` means unresolved data, a cycle, or budget
+    /// exhaustion prevented a reliable negative answer.
+    pub fn has_undefined_variant(self) -> Option<bool> {
+        self.try_any_variant_matches(|data| {
+            matches!(data, TypeData::Undefined | TypeData::VoidKeyword)
+        })
     }
 
+    /// Returns whether a reachable variant is invalid or unsafe as a `+` operand.
     pub fn has_invalid_plus_operand_variant(self) -> bool {
-        self.any_variant_matches(|data| match data {
+        // Exhaustion returns `false`, which can only suppress this diagnostic.
+        self.try_any_variant_matches(|data| match data {
             TypeData::NeverKeyword | TypeData::Symbol | TypeData::UnknownKeyword => true,
             TypeData::Literal(literal) => {
                 matches!(literal.literal(self.db), Literal::Object(_))
@@ -458,10 +524,12 @@ impl<'db> InferredType<'db> {
                 .all(|ty| is_object_like(self.db, *ty)),
             data => is_object_like(self.db, data),
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether a reachable variant is number-like.
     pub fn has_number_like_variant(self) -> bool {
-        self.any_variant_matches(|data| {
+        self.try_any_variant_matches(|data| {
             matches!(data, TypeData::Number)
                 || matches!(
                     data,
@@ -469,10 +537,12 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::Number(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns whether a reachable variant is bigint-like.
     pub fn has_bigint_like_variant(self) -> bool {
-        self.any_variant_matches(|data| {
+        self.try_any_variant_matches(|data| {
             matches!(data, TypeData::BigInt)
                 || matches!(
                     data,
@@ -480,24 +550,39 @@ impl<'db> InferredType<'db> {
                         if matches!(literal.literal(self.db), Literal::BigInt(_))
                 )
         })
+        .unwrap_or(false)
     }
 
+    /// Returns a coarse diagnostic description of this type.
     pub fn plus_operand_description(self) -> String {
         type_description(self.db, self.data)
     }
 
-    pub fn switch_case_variants(self) -> Vec<InferredSwitchCase> {
+    /// Collects deduplicated switch-case representations reachable from this type.
+    ///
+    /// Returns `None` only when the traversal budget is exhausted.
+    ///
+    /// ```
+    /// use biome_js_type_info::{InferredSwitchCase, InferredType};
+    ///
+    /// fn includes_both_booleans(ty: InferredType<'_>) -> Option<bool> {
+    ///     Some(ty.try_switch_case_variants()?.contains(&InferredSwitchCase::Boolean))
+    /// }
+    /// ```
+    pub fn try_switch_case_variants(self) -> Option<Vec<InferredSwitchCase>> {
         let mut cases = Vec::new();
         let mut seen = FxHashSet::default();
         let mut pending = vec![self.data];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                break;
-            };
+        while let Some(data) = pending.pop() {
             if !seen.insert(data) {
                 continue;
             }
+            if remaining_steps == 0 {
+                return None;
+            }
+            remaining_steps -= 1;
 
             match data {
                 TypeData::Boolean => cases.push(InferredSwitchCase::Boolean),
@@ -539,9 +624,19 @@ impl<'db> InferredType<'db> {
 
         let mut unique_cases = FxHashSet::default();
         cases.retain(|case| unique_cases.insert(case.clone()));
-        cases
+        Some(cases)
     }
 
+    /// Classifies whether stringifying this type avoids the base object representation.
+    ///
+    /// ```
+    /// use biome_js_type_info::{InferredType, StringificationMode, StringificationUsefulness};
+    ///
+    /// fn stringifies_usefully(ty: InferredType<'_>) -> bool {
+    ///     ty.stringification_usefulness(StringificationMode::ToString, &["Error", "RegExp"])
+    ///         == StringificationUsefulness::Always
+    /// }
+    /// ```
     pub fn stringification_usefulness(
         self,
         mode: StringificationMode,
@@ -551,6 +646,7 @@ impl<'db> InferredType<'db> {
         stringification_usefulness(self.db, self.data, mode, ignored_type_names, &mut active, 0)
     }
 
+    /// Conservatively returns whether this type could equal `value`.
     pub fn could_equal_string_literal(self, value: &str) -> bool {
         self.could_equal_literal(|data| match data {
             TypeData::String => Some(true),
@@ -562,6 +658,7 @@ impl<'db> InferredType<'db> {
         })
     }
 
+    /// Conservatively returns whether this type could equal `value`.
     pub fn could_equal_number_literal(self, value: f64) -> bool {
         self.could_equal_literal(|data| match data {
             TypeData::Number => Some(true),
@@ -573,6 +670,7 @@ impl<'db> InferredType<'db> {
         })
     }
 
+    /// Conservatively returns whether this type could equal `value`.
     pub fn could_equal_boolean_literal(self, value: bool) -> bool {
         self.could_equal_literal(|data| match data {
             TypeData::Boolean => Some(true),
@@ -584,6 +682,7 @@ impl<'db> InferredType<'db> {
         })
     }
 
+    /// Conservatively returns whether this type could be nullish.
     pub fn could_equal_null(self) -> bool {
         self.could_equal_literal(|data| {
             Some(matches!(
@@ -593,60 +692,95 @@ impl<'db> InferredType<'db> {
         })
     }
 
+    /// Returns whether the top-level type is exactly `null`.
     pub const fn is_null(self) -> bool {
         matches!(self.data, TypeData::Null)
     }
 
+    /// Returns whether the top-level type is exactly `undefined`.
     pub const fn is_undefined(self) -> bool {
         matches!(self.data, TypeData::Undefined)
     }
 
-    fn all_variants_match(self, mut predicate: impl FnMut(TypeData<'db>) -> bool) -> bool {
-        let mut saw_variant = false;
-        let mut seen = FxHashSet::default();
-        let mut pending = vec![self.data];
+    fn try_all_variants_match(
+        self,
+        mut predicate: impl FnMut(TypeData<'db>) -> bool,
+    ) -> Option<bool> {
+        enum Visit<'db> {
+            Enter(TypeData<'db>),
+            Exit(TypeData<'db>),
+        }
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                return saw_variant;
+        let mut saw_variant = false;
+        let mut indeterminate = false;
+        let mut active = FxHashSet::default();
+        let mut completed = FxHashSet::default();
+        let mut pending = vec![Visit::Enter(self.data)];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
+
+        while let Some(visit) = pending.pop() {
+            let data = match visit {
+                Visit::Exit(data) => {
+                    active.remove(&data);
+                    completed.insert(data);
+                    continue;
+                }
+                Visit::Enter(data) => data,
             };
-            if !seen.insert(data) {
+            if completed.contains(&data) {
                 continue;
             }
+            if !active.insert(data) {
+                indeterminate = true;
+                continue;
+            }
+            if remaining_steps == 0 {
+                return None;
+            }
+            remaining_steps -= 1;
+            pending.push(Visit::Exit(data));
 
             match data {
                 TypeData::Union(union) => {
                     if union.types(self.db).is_empty() {
-                        return false;
+                        return Some(false);
                     }
-                    pending.extend(union.types(self.db).iter().copied());
+                    pending.extend(union.types(self.db).iter().copied().map(Visit::Enter));
                 }
                 TypeData::Generic(generic) => {
                     let Some(constraint) = generic.constraint(self.db) else {
-                        return false;
+                        indeterminate = true;
+                        continue;
                     };
-                    pending.push(constraint);
+                    pending.push(Visit::Enter(constraint));
                 }
+                data if is_indeterminate_type(data) => indeterminate = true,
                 _ if predicate(data) => saw_variant = true,
-                _ => return false,
+                _ => return Some(false),
             }
         }
 
-        false
+        if indeterminate {
+            None
+        } else {
+            Some(saw_variant)
+        }
     }
 
     fn conditional_type(self) -> ConditionalType {
         let mut conditional = ConditionalType::Unknown;
         let mut seen = FxHashSet::default();
         let mut pending = vec![self.data];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                return conditional;
-            };
+        while let Some(data) = pending.pop() {
             if !seen.insert(data) {
                 continue;
             }
+            if remaining_steps == 0 {
+                return ConditionalType::Unknown;
+            }
+            remaining_steps -= 1;
 
             if let Some(next) = data.conditional_type_shallow(self.db) {
                 conditional = if conditional == ConditionalType::Unknown {
@@ -662,7 +796,18 @@ impl<'db> InferredType<'db> {
                         };
                         pending.push(constraint);
                     }
-                    TypeData::InstanceOf(instance) => pending.push(instance.ty(self.db)),
+                    TypeData::InstanceOf(instance) => {
+                        let target = instance.ty(self.db);
+                        if target.is_array_class(self.db) {
+                            conditional = if conditional == ConditionalType::Unknown {
+                                ConditionalType::Truthy
+                            } else {
+                                conditional.merged_with(ConditionalType::Truthy)
+                            };
+                        } else {
+                            pending.push(target);
+                        }
+                    }
                     TypeData::Intersection(intersection) => {
                         pending.extend(intersection.types(self.db).iter().copied());
                     }
@@ -689,20 +834,22 @@ impl<'db> InferredType<'db> {
             }
         }
 
-        ConditionalType::Unknown
+        conditional
     }
 
     fn could_equal_literal(self, mut predicate: impl FnMut(TypeData<'db>) -> Option<bool>) -> bool {
         let mut seen = FxHashSet::default();
         let mut pending = vec![self.data];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                return false;
-            };
+        while let Some(data) = pending.pop() {
             if !seen.insert(data) {
                 continue;
             }
+            if remaining_steps == 0 {
+                return true;
+            }
+            remaining_steps -= 1;
 
             match data {
                 TypeData::Unknown
@@ -731,39 +878,73 @@ impl<'db> InferredType<'db> {
             }
         }
 
-        true
+        false
     }
 
-    fn any_variant_matches(self, mut predicate: impl FnMut(TypeData<'db>) -> bool) -> bool {
-        let mut seen = FxHashSet::default();
-        let mut pending = vec![self.data];
+    fn try_any_variant_matches(
+        self,
+        mut predicate: impl FnMut(TypeData<'db>) -> bool,
+    ) -> Option<bool> {
+        enum Visit<'db> {
+            Enter(TypeData<'db>),
+            Exit(TypeData<'db>),
+        }
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                return false;
+        let mut indeterminate = false;
+        let mut active = FxHashSet::default();
+        let mut completed = FxHashSet::default();
+        let mut pending = vec![Visit::Enter(self.data)];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
+
+        while let Some(visit) = pending.pop() {
+            let data = match visit {
+                Visit::Exit(data) => {
+                    active.remove(&data);
+                    completed.insert(data);
+                    continue;
+                }
+                Visit::Enter(data) => data,
             };
-            if !seen.insert(data) {
+            if completed.contains(&data) {
                 continue;
             }
+            if !active.insert(data) {
+                indeterminate = true;
+                continue;
+            }
+            if remaining_steps == 0 {
+                return None;
+            }
+            remaining_steps -= 1;
+            pending.push(Visit::Exit(data));
 
             match data {
                 TypeData::Generic(generic) => {
                     if let Some(constraint) = generic.constraint(self.db) {
-                        pending.push(constraint);
+                        pending.push(Visit::Enter(constraint));
+                    } else {
+                        indeterminate = true;
                     }
                 }
-                TypeData::InstanceOf(instance) => pending.push(instance.ty(self.db)),
-                TypeData::TypeofType(typeof_type) => pending.push(typeof_type.ty(self.db)),
-                TypeData::TypeofValue(typeof_value) => pending.push(typeof_value.ty(self.db)),
-                TypeData::Union(union) => {
-                    pending.extend(union.types(self.db).iter().copied());
+                TypeData::InstanceOf(instance) => {
+                    pending.push(Visit::Enter(instance.ty(self.db)));
                 }
-                data if predicate(data) => return true,
+                TypeData::TypeofType(typeof_type) => {
+                    pending.push(Visit::Enter(typeof_type.ty(self.db)));
+                }
+                TypeData::TypeofValue(typeof_value) => {
+                    pending.push(Visit::Enter(typeof_value.ty(self.db)));
+                }
+                TypeData::Union(union) => {
+                    pending.extend(union.types(self.db).iter().copied().map(Visit::Enter));
+                }
+                data if is_indeterminate_type(data) => indeterminate = true,
+                data if predicate(data) => return Some(true),
                 _ => {}
             }
         }
 
-        false
+        if indeterminate { None } else { Some(false) }
     }
 
     fn function_return_matches(self, predicate: impl Fn(TypeData<'db>) -> bool) -> bool {
@@ -779,14 +960,16 @@ impl<'db> InferredType<'db> {
     fn has_computed_member(self, name: &str) -> bool {
         let mut seen = FxHashSet::default();
         let mut pending = vec![self.data];
+        let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
 
-        for _ in 0..MAX_TYPE_VARIANT_STEPS {
-            let Some(data) = pending.pop() else {
-                return false;
-            };
+        while let Some(data) = pending.pop() {
             if !seen.insert(data) {
                 continue;
             }
+            if remaining_steps == 0 {
+                return false;
+            }
+            remaining_steps -= 1;
 
             match data {
                 TypeData::Class(class) => {
@@ -842,6 +1025,8 @@ impl<'db> InferredType<'db> {
             }
         }
 
+        // `useDisposables` only diagnoses and fixes on `true`, so exhaustion
+        // cannot create a false positive or an unsafe fix.
         false
     }
 }
@@ -897,600 +1082,15 @@ fn canonical_bigint_text(text: &Text) -> Text {
     Text::new_owned(result.into())
 }
 
-const MAX_RETURN_TYPE_STEPS: usize = 50;
-const MAX_RETURN_TYPE_DESCRIPTION_LENGTH: usize = 80;
-const RETURN_TYPE_SEPARATOR: &str = " | ";
-
-fn is_escape_hatch(ty: TypeData<'_>) -> bool {
-    matches!(
-        ty,
-        TypeData::AnyKeyword
-            | TypeData::VoidKeyword
-            | TypeData::UnknownKeyword
-            | TypeData::NeverKeyword
-            | TypeData::Unknown
-            | TypeData::ThisKeyword
-    )
-}
-
-fn normalize_boolean_return_types<'db>(
-    db: &'db dyn TypeDb,
-    mut types: Vec<TypeData<'db>>,
-) -> Vec<TypeData<'db>> {
-    let has_boolean = types.contains(&TypeData::Boolean);
-    let has_true = types.iter().any(|ty| ty.is_boolean_literal(db, true));
-    let has_false = types.iter().any(|ty| ty.is_boolean_literal(db, false));
-    if !(has_boolean || has_true && has_false) {
-        return types;
-    }
-
-    let mut seen_boolean = false;
-    types.retain(|ty| {
-        if matches!(ty, TypeData::Boolean) {
-            if seen_boolean {
-                return false;
-            }
-            seen_boolean = true;
-            return true;
-        }
-        !ty.is_boolean_literal(db, true) && !ty.is_boolean_literal(db, false)
-    });
-    if !seen_boolean {
-        types.push(TypeData::Boolean);
-    }
-    types
-}
-
-fn promise_inner<'db>(db: &'db dyn TypeDb, ty: TypeData<'db>) -> Option<TypeData<'db>> {
-    let TypeData::InstanceOf(instance) = ty else {
-        return None;
-    };
-    if !instance.ty(db).is_promise_class(db) {
-        return None;
-    }
-    instance
-        .type_parameters(db)
-        .first()
-        .copied()
-        .filter(|ty| !is_escape_hatch(*ty))
-}
-
-fn union_variants<'db>(db: &'db dyn TypeDb, ty: TypeData<'db>) -> Vec<TypeData<'db>> {
-    match ty {
-        TypeData::Union(union) => union.types(db).to_vec(),
-        ty => Vec::from([ty]),
-    }
-}
-
-fn collapse_union_absorbed_by_primitive<'db>(
-    db: &'db dyn TypeDb,
-    ty: TypeData<'db>,
-) -> Option<TypeData<'db>> {
-    let TypeData::Union(_) = ty else {
-        return None;
-    };
-    let variants = union_variants(db, ty);
-    let mut primitive = None;
-    for variant in &variants {
-        if matches!(
-            variant,
-            TypeData::String | TypeData::Number | TypeData::Boolean | TypeData::BigInt
-        ) {
-            if primitive.is_some() {
-                return None;
-            }
-            primitive = Some(*variant);
-        }
-    }
-    let primitive = primitive?;
-    variants
-        .iter()
-        .all(|variant| {
-            types_match(db, *variant, primitive) || is_nonunion_wider(db, primitive, *variant)
-        })
-        .then_some(primitive)
-}
-
-fn includes_object_keyword(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    matches!(ty, TypeData::ObjectKeyword)
-        || matches!(ty, TypeData::Union(_))
-            && union_variants(db, ty)
-                .iter()
-                .any(|variant| matches!(variant, TypeData::ObjectKeyword))
-}
-
-fn includes_undefined(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    matches!(ty, TypeData::Undefined | TypeData::VoidKeyword)
-        || matches!(ty, TypeData::Union(_))
-            && union_variants(db, ty)
-                .iter()
-                .any(|variant| matches!(variant, TypeData::Undefined | TypeData::VoidKeyword))
-}
-
-fn is_any_contaminated(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    match ty {
-        TypeData::AnyKeyword => true,
-        TypeData::Union(union) => union
-            .types(db)
-            .iter()
-            .any(|ty| matches!(ty, TypeData::AnyKeyword)),
-        TypeData::Intersection(intersection) => intersection
-            .types(db)
-            .iter()
-            .any(|ty| matches!(ty, TypeData::AnyKeyword)),
-        _ => false,
-    }
-}
-
-fn is_intersection_with_type_param(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    matches!(ty, TypeData::Intersection(intersection) if intersection.types(db).iter().any(|ty| matches!(ty, TypeData::Generic(_))))
-}
-
-fn is_literal_of_primitive(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    match ty {
-        TypeData::Literal(literal) => matches!(
-            literal.literal(db),
-            Literal::BigInt(_)
-                | Literal::Boolean(_)
-                | Literal::Number(_)
-                | Literal::String(_)
-                | Literal::Template(_)
-        ),
-        TypeData::Union(union) if union.types(db).len() == 1 => {
-            is_literal_of_primitive(db, union.types(db)[0])
-        }
-        _ => false,
-    }
-}
-
-fn is_base_type_of_literal(db: &dyn TypeDb, base: TypeData<'_>, literal: TypeData<'_>) -> bool {
-    matches!(literal.literal_base_type(db), Some(literal_base) if literal_base == base)
-}
-
-fn is_only_property_literal_widening(
-    db: &dyn TypeDb,
-    annotation: TypeData<'_>,
-    returns: &[TypeData<'_>],
-) -> bool {
-    returns.iter().all(|inferred| {
-        let mut stack = vec![(annotation, *inferred)];
-        let mut has_widening = false;
-        let mut iterations = 0;
-
-        while let Some((annotated, inferred)) = stack.pop() {
-            iterations += 1;
-            if iterations > MAX_RETURN_TYPE_STEPS {
-                return false;
-            }
-
-            if let TypeData::Tuple(annotated_tuple) = annotated {
-                let TypeData::Tuple(inferred_tuple) = inferred else {
-                    return false;
-                };
-                let annotated_elements = annotated_tuple.elements(db);
-                let inferred_elements = inferred_tuple.elements(db);
-                if annotated_elements.len() != inferred_elements.len()
-                    || annotated_elements.is_empty()
-                {
-                    return false;
-                }
-                for (annotated_element, inferred_element) in
-                    annotated_elements.iter().zip(inferred_elements)
-                {
-                    if types_match(db, annotated_element.ty, inferred_element.ty) {
-                        continue;
-                    }
-                    if is_base_type_of_literal(db, annotated_element.ty, inferred_element.ty) {
-                        has_widening = true;
-                    } else {
-                        stack.push((annotated_element.ty, inferred_element.ty));
-                    }
-                }
-                continue;
-            }
-
-            let TypeData::Object(annotated_object) = annotated else {
-                return false;
-            };
-            let annotated_members = annotated_object.members(db);
-            if annotated_members.is_empty() {
-                return false;
-            }
-            let inferred_members = match inferred {
-                TypeData::Object(object) => object.members(db),
-                TypeData::Literal(literal) => match literal.literal(db) {
-                    Literal::Object(members) => members,
-                    _ => return false,
-                },
-                _ => return false,
-            };
-            if inferred_members.is_empty() {
-                return false;
-            }
-
-            if let Some(index_signature) = annotated_members
-                .iter()
-                .find_map(|member| member.kind.index_signature_type().map(|_| member))
-            {
-                let mut index_has_widening = false;
-                let all_covered = inferred_members.iter().all(|member| {
-                    if member.kind.is_const_asserted() {
-                        return false;
-                    }
-                    if types_match(db, index_signature.ty, member.ty) {
-                        return true;
-                    }
-                    if is_base_type_of_literal(db, index_signature.ty, member.ty) {
-                        index_has_widening = true;
-                        return true;
-                    }
-                    false
-                });
-                if !(all_covered && index_has_widening) {
-                    return false;
-                }
-                has_widening = true;
-                continue;
-            }
-
-            for annotated_member in annotated_members {
-                let Some(name) = annotated_member.kind.name() else {
-                    continue;
-                };
-                let Some(inferred_member) = inferred_members
-                    .iter()
-                    .find(|member| member.kind.has_name(name.text()))
-                else {
-                    return false;
-                };
-                if inferred_member.kind.is_const_asserted() {
-                    return false;
-                }
-                if types_match(db, annotated_member.ty, inferred_member.ty) {
-                    continue;
-                }
-                if is_base_type_of_literal(db, annotated_member.ty, inferred_member.ty) {
-                    has_widening = true;
-                } else {
-                    stack.push((annotated_member.ty, inferred_member.ty));
-                }
-            }
-        }
-
-        has_widening
-    })
-}
-
-fn resolve_generic_chain<'db>(db: &'db dyn TypeDb, mut ty: TypeData<'db>) -> TypeData<'db> {
-    for _ in 0..6 {
-        let TypeData::Generic(generic) = ty else {
-            break;
-        };
-        let Some(constraint) = generic.constraint(db) else {
-            break;
-        };
-        ty = constraint;
-    }
-    ty
-}
-
-fn type_members<'db>(db: &'db dyn TypeDb, ty: TypeData<'db>) -> Option<&'db [TypeMember<'db>]> {
-    match ty {
-        TypeData::Object(object) => Some(object.members(db)),
-        TypeData::Literal(literal) => match literal.literal(db) {
-            Literal::Object(members) => Some(members),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn is_strictly_narrower_than_object_keyword(db: &dyn TypeDb, ty: TypeData<'_>) -> bool {
-    match ty {
-        TypeData::Object(object) => !object.members(db).is_empty(),
-        TypeData::InstanceOf(instance) => match instance.ty(db) {
-            TypeData::Class(class) => {
-                class_has_instance_shape(db, class, &mut FxHashSet::default(), 0)
-            }
-            _ => true,
-        },
-        TypeData::Tuple(_) | TypeData::Function(_) => true,
-        TypeData::Literal(literal) => match literal.literal(db) {
-            Literal::RegExp(_) => true,
-            Literal::Object(members) => !members.is_empty(),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn class_has_instance_shape<'db>(
-    db: &'db dyn TypeDb,
-    class: crate::interned_types::InternedClass<'db>,
-    seen: &mut FxHashSet<TypeData<'db>>,
-    depth: usize,
-) -> bool {
-    let ty = TypeData::Class(class);
-    if depth >= MAX_RETURN_TYPE_STEPS || !seen.insert(ty) {
-        return false;
-    }
-    if class
-        .members(db)
-        .iter()
-        .any(|member| !member.kind.is_static())
-    {
-        return true;
-    }
-    class.extends(db).is_some_and(|base| match base {
-        TypeData::Class(base) => class_has_instance_shape(db, base, seen, depth + 1),
-        TypeData::InstanceOf(instance) => match instance.ty(db) {
-            TypeData::Class(base) => class_has_instance_shape(db, base, seen, depth + 1),
-            _ => true,
-        },
-        _ => true,
-    })
-}
-
-fn is_nonunion_wider<'db>(
-    db: &'db dyn TypeDb,
-    annotated: TypeData<'db>,
-    inferred: TypeData<'db>,
-) -> bool {
-    let mut stack = vec![(annotated, resolve_generic_chain(db, inferred))];
-    let mut found_wider = false;
-    let mut iterations = 0;
-
-    while let Some((annotated, inferred)) = stack.pop() {
-        iterations += 1;
-        if iterations > MAX_RETURN_TYPE_STEPS {
-            return false;
-        }
-        if is_base_type_of_literal(db, annotated, inferred) {
-            found_wider = true;
-            continue;
-        }
-        if types_match(db, annotated, inferred) {
-            continue;
-        }
-
-        match (annotated, inferred) {
-            (TypeData::ObjectKeyword, TypeData::InstanceOf(_)) => found_wider = true,
-            (TypeData::InstanceOf(annotated), TypeData::InstanceOf(inferred)) => {
-                if !types_match(db, annotated.ty(db), inferred.ty(db)) {
-                    return false;
-                }
-                let annotated_parameters = annotated.type_parameters(db);
-                let inferred_parameters = inferred.type_parameters(db);
-                if annotated_parameters.len() != inferred_parameters.len()
-                    || annotated_parameters.is_empty()
-                {
-                    return false;
-                }
-                stack.extend(annotated_parameters.iter().zip(inferred_parameters).map(
-                    |(annotated, inferred)| (*annotated, resolve_generic_chain(db, *inferred)),
-                ));
-            }
-            (TypeData::Object(_), TypeData::Object(_) | TypeData::Literal(_)) => {
-                if !push_object_pairs(db, annotated, inferred, &mut stack) {
-                    return false;
-                }
-            }
-            (TypeData::ObjectKeyword, inferred)
-                if is_strictly_narrower_than_object_keyword(db, inferred) =>
-            {
-                found_wider = true;
-            }
-            (TypeData::Tuple(annotated), TypeData::Tuple(inferred)) => {
-                let annotated_elements = annotated.elements(db);
-                let inferred_elements = inferred.elements(db);
-                if annotated_elements.len() != inferred_elements.len()
-                    || annotated_elements.is_empty()
-                {
-                    return false;
-                }
-                stack.extend(annotated_elements.iter().zip(inferred_elements).map(
-                    |(annotated, inferred)| (annotated.ty, resolve_generic_chain(db, inferred.ty)),
-                ));
-            }
-            _ => return false,
-        }
-    }
-
-    found_wider
-}
-
-fn push_object_pairs<'db>(
-    db: &'db dyn TypeDb,
-    annotated: TypeData<'db>,
-    inferred: TypeData<'db>,
-    stack: &mut Vec<(TypeData<'db>, TypeData<'db>)>,
-) -> bool {
-    let Some(annotated_members) = type_members(db, annotated) else {
-        return false;
-    };
-    let Some(inferred_members) = type_members(db, inferred) else {
-        return false;
-    };
-    if annotated_members.is_empty() || inferred_members.is_empty() {
-        return false;
-    }
-
-    if let Some(index_signature) = annotated_members.iter().find(|member| {
-        matches!(
-            member.kind,
-            TypeMemberKind::IndexSignature(_) | TypeMemberKind::ConstAssertedIndexSignature(_)
-        )
-    }) {
-        stack.extend(
-            inferred_members
-                .iter()
-                .map(|member| (index_signature.ty, resolve_generic_chain(db, member.ty))),
-        );
-        return true;
-    }
-
-    for annotated_member in annotated_members {
-        let Some(name) = annotated_member.kind.name() else {
-            continue;
-        };
-        let Some(inferred_member) = inferred_members
-            .iter()
-            .find(|member| member.kind.has_name(name.text()))
-        else {
-            return false;
-        };
-        stack.push((
-            annotated_member.ty,
-            resolve_generic_chain(db, inferred_member.ty),
-        ));
-    }
-    true
-}
-
-fn is_wider_than<'db>(
-    db: &'db dyn TypeDb,
-    annotated: TypeData<'db>,
-    inferred: TypeData<'db>,
-) -> bool {
-    let inferred = resolve_generic_chain(db, inferred);
-    match (annotated, inferred) {
-        (TypeData::String, TypeData::String)
-        | (TypeData::Number, TypeData::Number)
-        | (TypeData::Boolean, TypeData::Boolean)
-        | (TypeData::BigInt, TypeData::BigInt) => false,
-        (TypeData::Union(_), _) => is_union_wider(db, annotated, inferred),
-        (_, TypeData::Union(_)) => {
-            let variants = union_variants(db, inferred);
-            let has_base = variants
-                .iter()
-                .any(|variant| types_match(db, annotated, *variant));
-            let all_subsumed = variants.iter().all(|variant| {
-                types_match(db, annotated, *variant)
-                    || is_base_type_of_literal(db, annotated, *variant)
-            });
-            if has_base && all_subsumed {
-                return false;
-            }
-            variants.iter().all(|variant| {
-                types_match(db, annotated, *variant) || is_nonunion_wider(db, annotated, *variant)
-            }) && variants
-                .iter()
-                .any(|variant| is_nonunion_wider(db, annotated, *variant))
-        }
-        _ => is_nonunion_wider(db, annotated, inferred),
-    }
-}
-
-fn is_union_wider_than_returns<'db>(
-    db: &'db dyn TypeDb,
-    annotated: TypeData<'db>,
-    returns: &[TypeData<'db>],
-) -> bool {
-    let variants = union_variants(db, annotated);
-    if !returns.iter().all(|return_ty| {
-        variants.iter().any(|variant| {
-            types_match(db, *variant, *return_ty) || is_nonunion_wider(db, *variant, *return_ty)
-        })
-    }) {
-        return false;
-    }
-    let has_extra = variants.iter().any(|variant| {
-        !returns.iter().any(|return_ty| {
-            types_match(db, *variant, *return_ty) || is_nonunion_wider(db, *variant, *return_ty)
-        })
-    });
-    let has_wider = returns.iter().any(|return_ty| {
-        !variants
-            .iter()
-            .any(|variant| types_match(db, *variant, *return_ty))
-            && variants
-                .iter()
-                .any(|variant| is_nonunion_wider(db, *variant, *return_ty))
-    });
-    has_extra || has_wider
-}
-
-fn is_union_wider<'db>(
-    db: &'db dyn TypeDb,
-    annotated: TypeData<'db>,
-    inferred: TypeData<'db>,
-) -> bool {
-    let annotated_variants = union_variants(db, annotated);
-    let inferred_variants = union_variants(db, inferred);
-    if !inferred_variants.iter().all(|inferred| {
-        annotated_variants.iter().any(|annotated| {
-            types_match(db, *annotated, *inferred) || is_nonunion_wider(db, *annotated, *inferred)
-        })
-    }) {
-        return false;
-    }
-
-    annotated_variants
-        .iter()
-        .filter(|variant| {
-            let TypeData::Generic(generic) = variant else {
-                return true;
-            };
-            let Some(constraint) = generic.constraint(db) else {
-                return true;
-            };
-            !annotated_variants.iter().any(|other| {
-                other != *variant
-                    && (types_match(db, *other, constraint)
-                        || is_nonunion_wider(db, *other, constraint))
-            })
-        })
-        .any(|annotated| {
-            !inferred_variants.iter().any(|inferred| {
-                types_match(db, *annotated, *inferred)
-                    || is_nonunion_wider(db, *annotated, *inferred)
-            })
-        })
-}
-
-fn types_match<'db>(
-    db: &'db dyn TypeDb,
-    mut left: TypeData<'db>,
-    mut right: TypeData<'db>,
-) -> bool {
-    for _ in 0..MAX_RETURN_TYPE_STEPS {
-        if left == right {
-            return true;
-        }
-        match (left, right) {
-            (TypeData::Generic(left_generic), TypeData::Generic(right_generic)) => {
-                return left_generic.name(db) == right_generic.name(db);
-            }
-            (TypeData::InstanceOf(left_instance), TypeData::InstanceOf(right_instance))
-                if left_instance.type_parameters(db).is_empty()
-                    && right_instance.type_parameters(db).is_empty() =>
-            {
-                left = left_instance.ty(db);
-                right = right_instance.ty(db);
-            }
-            (TypeData::Generic(generic), TypeData::InstanceOf(instance))
-                if instance.type_parameters(db).is_empty() =>
-            {
-                return matches!(instance.ty(db), TypeData::Generic(other) if generic.name(db) == other.name(db));
-            }
-            (TypeData::InstanceOf(instance), TypeData::Generic(generic))
-                if instance.type_parameters(db).is_empty() =>
-            {
-                return matches!(instance.ty(db), TypeData::Generic(other) if generic.name(db) == other.name(db));
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
 fn is_at_least_as_wide_as_object<'db>(
     db: &'db dyn TypeDb,
     ty: TypeData<'db>,
     seen: &mut FxHashSet<TypeData<'db>>,
     depth: usize,
 ) -> bool {
-    if depth >= MAX_RETURN_TYPE_STEPS || !seen.insert(ty) {
+    // Exhaustion conservatively treats the target as at least as wide as
+    // `object`; callers must not infer a narrower shape from a partial walk.
+    if depth >= MAX_TYPE_RELATION_DEPTH || !seen.insert(ty) {
         return true;
     }
     let result = match ty {
@@ -1537,87 +1137,46 @@ fn is_at_least_as_wide_as_object<'db>(
     result
 }
 
-fn literal_text(db: &dyn TypeDb, ty: TypeData<'_>) -> Option<String> {
-    let TypeData::Literal(literal) = ty else {
-        return None;
-    };
-    match literal.literal(db) {
-        Literal::String(value) => Some(format!("\"{}\"", value.as_str())),
-        Literal::Number(value) => Some(value.as_str().to_string()),
-        Literal::Boolean(value) => Some(value.as_bool().to_string()),
-        _ => None,
-    }
-}
-
-fn renderable_variant(db: &dyn TypeDb, ty: TypeData<'_>) -> Option<String> {
-    match ty {
-        TypeData::String => Some("string".into()),
-        TypeData::Number => Some("number".into()),
-        TypeData::Boolean => Some("boolean".into()),
-        TypeData::BigInt => Some("bigint".into()),
-        _ => literal_text(db, ty),
-    }
-}
-
-fn clean_literal_text(text: &str) -> bool {
-    !text.contains("...") && !text.contains("__internal") && !text.contains("typeof import(")
-}
-
-fn join_description(parts: Vec<String>) -> Option<String> {
-    if parts.is_empty() || parts.iter().any(|part| !clean_literal_text(part)) {
-        return None;
-    }
-    let description = parts.join(RETURN_TYPE_SEPARATOR);
-    (description.len() <= MAX_RETURN_TYPE_DESCRIPTION_LENGTH).then_some(description)
-}
-
-fn render_inferred(db: &dyn TypeDb, returns: &[TypeData<'_>]) -> Option<String> {
-    join_description(
-        returns
-            .iter()
-            .map(|ty| literal_text(db, *ty))
-            .collect::<Option<Vec<_>>>()?,
-    )
-}
-
-fn render_narrowed<'db>(
-    db: &'db dyn TypeDb,
-    annotation: TypeData<'db>,
-    returns: &[TypeData<'db>],
-) -> Option<String> {
-    let variants = union_variants(db, annotation);
-    let covered = variants
-        .iter()
-        .filter(|variant| {
-            returns.iter().any(|return_ty| {
-                types_match(db, **variant, *return_ty)
-                    || is_nonunion_wider(db, **variant, *return_ty)
-            })
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    if covered.is_empty() || covered.len() == variants.len() {
-        return None;
-    }
-    let has_widening = covered.iter().any(|variant| {
-        returns.iter().any(|return_ty| {
-            !types_match(db, *variant, *return_ty) && is_nonunion_wider(db, *variant, *return_ty)
-        })
-    });
-    if has_widening
-        && !(covered.len() == 1 && returns.len() == 1 && is_literal_of_primitive(db, returns[0]))
-    {
-        return None;
-    }
-    join_description(
-        covered
-            .iter()
-            .map(|ty| renderable_variant(db, *ty))
-            .collect::<Option<Vec<_>>>()?,
-    )
-}
-
 fn stringification_usefulness<'db>(
+    db: &'db dyn TypeDb,
+    data: TypeData<'db>,
+    mode: StringificationMode,
+    ignored_type_names: &[&str],
+    active: &mut FxHashSet<TypeData<'db>>,
+    depth: usize,
+) -> StringificationUsefulness {
+    use StringificationUsefulness::Always;
+
+    if depth >= MAX_TYPE_VARIANT_DEPTH || !active.insert(data) {
+        return Always;
+    }
+
+    let result = if let TypeData::Generic(generic) = data {
+        generic.constraint(db).map_or(Always, |constraint| {
+            stringification_usefulness(db, constraint, mode, ignored_type_names, active, depth + 1)
+        })
+    } else if matches!(mode, StringificationMode::ToString) {
+        match is_ignored_stringification_type(db, data, ignored_type_names) {
+            None | Some(true) => Always,
+            Some(false) if is_safe_stringification_type(db, data) => Always,
+            Some(false) => stringification_usefulness_unignored(
+                db,
+                data,
+                mode,
+                ignored_type_names,
+                active,
+                depth,
+            ),
+        }
+    } else {
+        stringification_usefulness_unignored(db, data, mode, ignored_type_names, active, depth)
+    };
+
+    active.remove(&data);
+    result
+}
+
+fn stringification_usefulness_unignored<'db>(
     db: &'db dyn TypeDb,
     data: TypeData<'db>,
     mode: StringificationMode,
@@ -1627,79 +1186,55 @@ fn stringification_usefulness<'db>(
 ) -> StringificationUsefulness {
     use StringificationUsefulness::{Always, Never};
 
-    if depth >= MAX_TYPE_VARIANT_STEPS || !active.insert(data) {
-        return Always;
-    }
-
-    let result = if let TypeData::Generic(generic) = data {
-        generic.constraint(db).map_or(Always, |constraint| {
-            stringification_usefulness(db, constraint, mode, ignored_type_names, active, depth + 1)
-        })
-    } else if matches!(mode, StringificationMode::ToString)
-        && (is_ignored_stringification_type(db, data, ignored_type_names)
-            || is_safe_stringification_type(db, data))
-    {
-        Always
-    } else {
-        match data {
-            TypeData::Union(union) => {
-                combine_stringification_union(union.types(db).iter().map(|ty| {
-                    stringification_usefulness(db, *ty, mode, ignored_type_names, active, depth + 1)
-                }))
-            }
-            TypeData::Intersection(intersection) => {
-                combine_stringification_intersection(intersection.types(db).iter().map(|ty| {
-                    stringification_usefulness(db, *ty, mode, ignored_type_names, active, depth + 1)
-                }))
-            }
-            TypeData::Tuple(tuple) => {
-                combine_stringification_tuple(tuple.elements(db).iter().map(|element| {
-                    stringification_usefulness(
-                        db,
-                        element.ty,
-                        StringificationMode::ToString,
-                        ignored_type_names,
-                        active,
-                        depth + 1,
-                    )
-                }))
-            }
-            TypeData::InstanceOf(instance) if instance.ty(db).is_array_class(db) => instance
-                .type_parameters(db)
-                .first()
-                .map_or(Always, |element| {
-                    stringification_usefulness(
-                        db,
-                        *element,
-                        StringificationMode::ToString,
-                        ignored_type_names,
-                        active,
-                        depth + 1,
-                    )
-                }),
-            TypeData::InstanceOf(instance) => stringification_usefulness(
-                db,
-                instance.ty(db),
-                mode,
-                ignored_type_names,
-                active,
-                depth + 1,
-            ),
-            _ if matches!(mode, StringificationMode::Join) => Always,
-            _ => match uses_base_object_stringification(
-                db,
-                data,
-                &mut FxHashSet::default(),
-                depth + 1,
-            ) {
-                Some(true) => Never,
-                Some(false) | None => Always,
-            },
+    match data {
+        TypeData::Union(union) => combine_stringification_union(union.types(db).iter().map(|ty| {
+            stringification_usefulness(db, *ty, mode, ignored_type_names, active, depth + 1)
+        })),
+        TypeData::Intersection(intersection) => {
+            combine_stringification_intersection(intersection.types(db).iter().map(|ty| {
+                stringification_usefulness(db, *ty, mode, ignored_type_names, active, depth + 1)
+            }))
         }
-    };
-
-    active.remove(&data);
-    result
+        TypeData::Tuple(tuple) => {
+            combine_stringification_tuple(tuple.elements(db).iter().map(|element| {
+                stringification_usefulness(
+                    db,
+                    element.ty,
+                    StringificationMode::ToString,
+                    ignored_type_names,
+                    active,
+                    depth + 1,
+                )
+            }))
+        }
+        TypeData::InstanceOf(instance) if instance.ty(db).is_array_class(db) => instance
+            .type_parameters(db)
+            .first()
+            .map_or(Always, |element| {
+                stringification_usefulness(
+                    db,
+                    *element,
+                    StringificationMode::ToString,
+                    ignored_type_names,
+                    active,
+                    depth + 1,
+                )
+            }),
+        TypeData::InstanceOf(instance) => stringification_usefulness(
+            db,
+            instance.ty(db),
+            mode,
+            ignored_type_names,
+            active,
+            depth + 1,
+        ),
+        _ if matches!(mode, StringificationMode::Join) => Always,
+        _ => match uses_base_object_stringification(db, data, &mut FxHashSet::default(), depth + 1)
+        {
+            Some(true) => Never,
+            Some(false) | None => Always,
+        },
+    }
 }
 
 fn combine_stringification_union(
@@ -1778,17 +1313,19 @@ fn is_ignored_stringification_type<'db>(
     db: &'db dyn TypeDb,
     data: TypeData<'db>,
     ignored_type_names: &[&str],
-) -> bool {
+) -> Option<bool> {
     let mut seen = FxHashSet::default();
     let mut pending = vec![data];
+    let mut remaining_steps = MAX_TYPE_VARIANT_STEPS;
 
-    for _ in 0..MAX_TYPE_VARIANT_STEPS {
-        let Some(data) = pending.pop() else {
-            return false;
-        };
+    while let Some(data) = pending.pop() {
         if !seen.insert(data) {
             continue;
         }
+        if remaining_steps == 0 {
+            return None;
+        }
+        remaining_steps -= 1;
 
         let name = match data {
             TypeData::Class(class) => class.name(db).as_ref().map(Text::text),
@@ -1801,7 +1338,7 @@ fn is_ignored_stringification_type<'db>(
             _ => None,
         };
         if name.is_some_and(|name| ignored_type_names.contains(&name)) {
-            return true;
+            return Some(true);
         }
 
         match data {
@@ -1819,7 +1356,7 @@ fn is_ignored_stringification_type<'db>(
         }
     }
 
-    false
+    Some(false)
 }
 
 fn uses_base_object_stringification<'db>(
@@ -1828,7 +1365,9 @@ fn uses_base_object_stringification<'db>(
     active: &mut FxHashSet<TypeData<'db>>,
     depth: usize,
 ) -> Option<bool> {
-    if depth >= MAX_TYPE_VARIANT_STEPS || !active.insert(data) {
+    if depth >= MAX_TYPE_VARIANT_DEPTH || !active.insert(data) {
+        // `Always` suppresses `noBaseToString`; unknown ancestry must never be
+        // interpreted as proof that base object stringification is used.
         return Some(false);
     }
 
@@ -1893,7 +1432,7 @@ fn combine_base_stringification(results: impl Iterator<Item = Option<bool>>) -> 
     saw_true.then_some(true)
 }
 
-fn has_custom_stringification_member(members: &[crate::interned_types::TypeMember<'_>]) -> bool {
+fn has_custom_stringification_member(members: &[TypeMember<'_>]) -> bool {
     members.iter().any(|member| {
         ["toLocaleString", "toString", "valueOf"]
             .iter()
@@ -1901,22 +1440,178 @@ fn has_custom_stringification_member(members: &[crate::interned_types::TypeMembe
     })
 }
 
-fn is_promise_instance<'db>(db: &'db dyn TypeDb, mut data: TypeData<'db>) -> bool {
-    while let TypeData::InstanceOf(instance) = data {
-        data = instance.ty(db);
-        if data.is_promise_class(db) {
-            return true;
+pub(crate) fn is_promise_instance<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> Option<bool> {
+    let mut completed = FxHashSet::default();
+    let mut pending = VecDeque::from([(data, Vec::new())]);
+    let mut processed = 0;
+    let mut indeterminate = false;
+
+    while let Some((data, path)) = pending.pop_front() {
+        if path.contains(&data) {
+            indeterminate = true;
+            continue;
+        }
+        if !completed.insert(data) {
+            continue;
+        }
+        if processed == MAX_PROMISE_TYPE_STEPS {
+            indeterminate = true;
+            continue;
+        }
+        processed += 1;
+
+        if is_promise_target(db, data) {
+            return Some(true);
+        }
+        // Keep this fast path synchronized with the defensive variants below.
+        if is_indeterminate_type(data) {
+            indeterminate = true;
+            continue;
+        }
+
+        let mut child_path = path;
+        child_path.push(data);
+        let remaining_steps = MAX_PROMISE_TYPE_STEPS - processed;
+        let available_frontier = remaining_steps.saturating_sub(pending.len());
+        match data {
+            TypeData::Class(class) => {
+                if let Some(base) = class.extends(db) {
+                    if available_frontier == 0 {
+                        return None;
+                    }
+                    pending.push_back((base, child_path));
+                }
+            }
+            TypeData::Generic(generic) => {
+                if let Some(constraint) = generic.constraint(db) {
+                    if available_frontier == 0 {
+                        return None;
+                    }
+                    pending.push_back((constraint, child_path));
+                }
+            }
+            TypeData::InstanceOf(instance) => {
+                if available_frontier == 0 {
+                    return None;
+                }
+                pending.push_back((instance.ty(db), child_path));
+            }
+            TypeData::Interface(interface) => {
+                if interface.extends(db).len() > available_frontier {
+                    return None;
+                }
+                pending.extend(
+                    interface
+                        .extends(db)
+                        .iter()
+                        .copied()
+                        .map(|child| (child, child_path.clone())),
+                );
+            }
+            TypeData::Intersection(intersection) => {
+                if intersection.types(db).len() > available_frontier {
+                    return None;
+                }
+                pending.extend(
+                    intersection
+                        .types(db)
+                        .iter()
+                        .copied()
+                        .map(|child| (child, child_path.clone())),
+                );
+            }
+            TypeData::MergedReference(reference) => {
+                if reference.targets(db).count() > available_frontier {
+                    return None;
+                }
+                pending.extend(
+                    reference
+                        .targets(db)
+                        .map(|child| (child, child_path.clone())),
+                );
+            }
+            TypeData::TypeOperator(operator) => {
+                if available_frontier == 0 {
+                    return None;
+                }
+                pending.push_back((operator.ty(db), child_path));
+            }
+            TypeData::TypeofType(typeof_type) => {
+                if available_frontier == 0 {
+                    return None;
+                }
+                pending.push_back((typeof_type.ty(db), child_path));
+            }
+            TypeData::TypeofValue(typeof_value) => {
+                if available_frontier == 0 {
+                    return None;
+                }
+                pending.push_back((typeof_value.ty(db), child_path));
+            }
+            TypeData::Union(union) => {
+                if union.types(db).len() > available_frontier {
+                    return None;
+                }
+                pending.extend(
+                    union
+                        .types(db)
+                        .iter()
+                        .copied()
+                        .map(|child| (child, child_path.clone())),
+                );
+            }
+            TypeData::Global
+            | TypeData::GlobalType(_)
+            | TypeData::BigInt
+            | TypeData::Boolean
+            | TypeData::Null
+            | TypeData::Number
+            | TypeData::String
+            | TypeData::Symbol
+            | TypeData::Undefined
+            | TypeData::Conditional
+            | TypeData::Constructor(_)
+            | TypeData::Function(_)
+            | TypeData::Module(_)
+            | TypeData::Namespace(_)
+            | TypeData::Object(_)
+            | TypeData::Tuple(_)
+            | TypeData::Literal(_)
+            | TypeData::NeverKeyword
+            | TypeData::ObjectKeyword
+            | TypeData::ThisKeyword
+            | TypeData::VoidKeyword => {}
+            // These variants are handled by is_indeterminate_type above.
+            TypeData::Unknown
+            | TypeData::Divergent(_)
+            | TypeData::Local(_)
+            | TypeData::TypeofExpression(_)
+            | TypeData::AnyKeyword
+            | TypeData::UnknownKeyword => {
+                indeterminate = true;
+            }
         }
     }
 
-    false
+    if indeterminate { None } else { Some(false) }
 }
 
-fn contains_promise<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> bool {
-    match data {
-        TypeData::Union(union) => union.types(db).iter().any(|ty| contains_promise(db, *ty)),
-        data => is_promise_instance(db, data),
-    }
+fn is_promise_target<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> bool {
+    data.is_promise_class(db)
+        || matches!(data, TypeData::Class(class) if class.name(db).as_ref().is_some_and(|name| name.text() == "PromiseLike"))
+        || matches!(data, TypeData::Interface(interface) if interface.name(db).text() == "PromiseLike")
+}
+
+const fn is_indeterminate_type(data: TypeData<'_>) -> bool {
+    matches!(
+        data,
+        TypeData::Unknown
+            | TypeData::Divergent(_)
+            | TypeData::Local(_)
+            | TypeData::TypeofExpression(_)
+            | TypeData::AnyKeyword
+            | TypeData::UnknownKeyword
+    )
 }
 
 fn is_object_like<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> bool {
@@ -1976,6 +1671,7 @@ fn type_description<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> String {
             Literal::RegExp(_) => "RegExp".into(),
         },
         TypeData::Generic(_)
+        | TypeData::GlobalType(_)
         | TypeData::Local(_)
         | TypeData::MergedReference(_)
         | TypeData::TypeOperator(_)
@@ -1985,5 +1681,418 @@ fn type_description<'db>(db: &'db dyn TypeDb, data: TypeData<'db>) -> String {
         | TypeData::Conditional
         | TypeData::Global
         | TypeData::ThisKeyword => "unknown".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        globals_ids::PROMISE_ID_GLOBAL_TYPE_ID,
+        interned_types::{
+            InternedClass, InternedFunction, InternedGenericTypeParameter, InternedInterface,
+            InternedTypeInstance, InternedTypeofType, InternedUnion, TypeMemberKind,
+        },
+    };
+    use salsa::plumbing::FromId;
+
+    #[salsa::db]
+    #[derive(Default)]
+    struct TestDb {
+        storage: salsa::Storage<Self>,
+    }
+
+    #[salsa::db]
+    impl salsa::Database for TestDb {}
+
+    #[salsa::db]
+    impl biome_db::Db for TestDb {
+        fn parsed_source_for_path(
+            &self,
+            _path: &camino::Utf8Path,
+        ) -> Option<biome_db::ParsedSource> {
+            None
+        }
+    }
+
+    #[salsa::db]
+    impl TypeDb for TestDb {}
+
+    #[salsa::input]
+    struct PromiseChainSteps {
+        steps: usize,
+    }
+
+    #[salsa::tracked]
+    fn promise_chain_status(db: &dyn TypeDb, input: PromiseChainSteps) -> Option<bool> {
+        is_promise_instance(db, promise_class_chain(db, input.steps(db)))
+    }
+
+    fn promise_class_chain<'db>(db: &'db dyn TypeDb, steps: usize) -> TypeData<'db> {
+        assert!(steps >= 2);
+        let target = (2..steps).fold(
+            TypeData::GlobalType(PROMISE_ID_GLOBAL_TYPE_ID),
+            |extends, _| {
+                TypeData::Class(InternedClass::new(
+                    db,
+                    Box::default(),
+                    Some(extends),
+                    Box::default(),
+                    Box::default(),
+                    None,
+                ))
+            },
+        );
+        TypeData::InstanceOf(InternedTypeInstance::new(db, target, Box::default()))
+    }
+
+    fn promise_like_interface_chain<'db>(db: &'db dyn TypeDb, steps: usize) -> TypeData<'db> {
+        assert!(steps >= 2);
+        let target = (2..steps).fold(
+            TypeData::Interface(InternedInterface::new(
+                db,
+                Box::default(),
+                Box::default(),
+                Box::default(),
+                Text::new_static("PromiseLike"),
+            )),
+            |extends, _| {
+                let extends: Box<[_]> = Box::new([extends]);
+                TypeData::Interface(InternedInterface::new(
+                    db,
+                    Box::default(),
+                    extends,
+                    Box::default(),
+                    Text::new_static("Derived"),
+                ))
+            },
+        );
+        TypeData::InstanceOf(InternedTypeInstance::new(db, target, Box::default()))
+    }
+
+    fn typeof_chain<'db>(db: &'db TestDb, distinct_types: usize) -> TypeData<'db> {
+        assert!(distinct_types > 0);
+        (1..distinct_types).fold(TypeData::String, |ty, _| {
+            TypeData::TypeofType(InternedTypeofType::new(db, ty))
+        })
+    }
+
+    fn generic_chain<'db>(
+        db: &'db TestDb,
+        distinct_types: usize,
+        leaf: TypeData<'db>,
+    ) -> TypeData<'db> {
+        assert!(distinct_types > 0);
+        (1..distinct_types).fold(leaf, |constraint, index| {
+            TypeData::Generic(InternedGenericTypeParameter::new(
+                db,
+                Some(constraint),
+                None,
+                Text::new_owned(format!("T{index}").into_boxed_str()),
+            ))
+        })
+    }
+
+    fn class_chain<'db>(
+        db: &'db TestDb,
+        distinct_types: usize,
+        leaf_name: &'static str,
+        leaf_members: Box<[TypeMember<'db>]>,
+    ) -> TypeData<'db> {
+        assert!(distinct_types > 0);
+        (1..distinct_types).fold(
+            TypeData::Class(InternedClass::new(
+                db,
+                Box::default(),
+                None,
+                Box::default(),
+                leaf_members,
+                Some(Text::new_static(leaf_name)),
+            )),
+            |extends, _| {
+                TypeData::Class(InternedClass::new(
+                    db,
+                    Box::default(),
+                    Some(extends),
+                    Box::default(),
+                    Box::default(),
+                    None,
+                ))
+            },
+        )
+    }
+
+    #[test]
+    fn variant_predicates_report_exhaustion() {
+        let db = TestDb::default();
+
+        for distinct_types in [
+            MAX_TYPE_VARIANT_STEPS - 1,
+            MAX_TYPE_VARIANT_STEPS,
+            MAX_TYPE_VARIANT_STEPS + 1,
+        ] {
+            let expected = (distinct_types <= MAX_TYPE_VARIANT_STEPS).then_some(true);
+            let nullish =
+                InferredType::new(&db, generic_chain(&db, distinct_types, TypeData::Null));
+            assert_eq!(nullish.has_nullish_variant(), expected);
+            assert_eq!(nullish.has_null_variant(), expected);
+            assert_eq!(nullish.is_safe_for_nullish_coalescing(), expected);
+        }
+    }
+
+    #[test]
+    fn ignored_names_and_disposable_members_observe_variant_limit() {
+        let db = TestDb::default();
+        let dispose_member = TypeMember {
+            kind: TypeMemberKind::ComputedValueNamed(
+                Text::new_static("Symbol.dispose"),
+                TypeData::Symbol,
+            ),
+            ty: TypeData::Unknown,
+        };
+
+        for distinct_types in [
+            MAX_TYPE_VARIANT_STEPS - 1,
+            MAX_TYPE_VARIANT_STEPS,
+            MAX_TYPE_VARIANT_STEPS + 1,
+        ] {
+            let ignored = class_chain(&db, distinct_types, "Ignored", Box::default());
+            assert_eq!(
+                is_ignored_stringification_type(&db, ignored, &["Ignored"]),
+                (distinct_types <= MAX_TYPE_VARIANT_STEPS).then_some(true)
+            );
+            assert_eq!(
+                InferredType::new(&db, ignored)
+                    .stringification_usefulness(StringificationMode::ToString, &["Ignored"]),
+                StringificationUsefulness::Always
+            );
+
+            let disposable = class_chain(
+                &db,
+                distinct_types,
+                "DisposableLeaf",
+                Box::new([dispose_member.clone()]),
+            );
+            assert_eq!(
+                InferredType::new(&db, disposable).is_disposable(),
+                distinct_types <= MAX_TYPE_VARIANT_STEPS
+            );
+        }
+    }
+
+    #[test]
+    fn base_stringification_observes_recursion_depth_limit() {
+        let db = TestDb::default();
+
+        for distinct_types in [
+            MAX_TYPE_VARIANT_DEPTH - 1,
+            MAX_TYPE_VARIANT_DEPTH,
+            MAX_TYPE_VARIANT_DEPTH + 1,
+        ] {
+            let chain = class_chain(&db, distinct_types, "Base", Box::default());
+            assert_eq!(
+                uses_base_object_stringification(&db, chain, &mut FxHashSet::default(), 0),
+                Some(distinct_types <= MAX_TYPE_VARIANT_DEPTH),
+            );
+        }
+    }
+
+    #[test]
+    fn capped_predicates_terminate_on_cycles() {
+        let db = TestDb::default();
+        let reference = InternedGenericTypeParameter::from_id(unsafe { salsa::Id::from_index(0) });
+        let cycle = TypeData::Generic(InternedGenericTypeParameter::new(
+            &db,
+            Some(TypeData::Generic(reference)),
+            None,
+            Text::new_static("Cycle"),
+        ));
+
+        assert_eq!(InferredType::new(&db, cycle).has_null_variant(), None);
+        assert_eq!(
+            is_ignored_stringification_type(&db, cycle, &["Missing"]),
+            Some(false)
+        );
+        assert!(!InferredType::new(&db, cycle).is_disposable());
+    }
+
+    #[test]
+    fn nullish_predicates_preserve_indeterminate_variants() {
+        let db = TestDb::default();
+        let unconstrained = TypeData::Generic(InternedGenericTypeParameter::new(
+            &db,
+            None,
+            None,
+            Text::new_static("T"),
+        ));
+
+        for data in [
+            TypeData::Unknown,
+            TypeData::UnknownKeyword,
+            TypeData::AnyKeyword,
+            unconstrained,
+        ] {
+            let ty = InferredType::new(&db, data);
+            assert_eq!(ty.has_null_variant(), None);
+            assert_eq!(ty.has_undefined_variant(), None);
+            assert_eq!(ty.is_safe_for_nullish_coalescing(), None);
+        }
+
+        let null_or_unknown = TypeData::Union(InternedUnion::new(
+            &db,
+            Vec::from([TypeData::Null, TypeData::Unknown]).into_boxed_slice(),
+        ));
+        let ty = InferredType::new(&db, null_or_unknown);
+        assert_eq!(ty.has_null_variant(), Some(true));
+        assert_eq!(ty.has_undefined_variant(), None);
+        assert_eq!(ty.is_safe_for_nullish_coalescing(), None);
+    }
+
+    #[test]
+    fn switch_case_variants_observe_distinct_type_limit() {
+        let db = TestDb::default();
+
+        for distinct_types in [
+            MAX_TYPE_VARIANT_STEPS - 1,
+            MAX_TYPE_VARIANT_STEPS,
+            MAX_TYPE_VARIANT_STEPS + 1,
+        ] {
+            let variants = InferredType::new(&db, typeof_chain(&db, distinct_types))
+                .try_switch_case_variants();
+            if distinct_types <= MAX_TYPE_VARIANT_STEPS {
+                assert_eq!(variants, Some(Vec::new()));
+            } else {
+                assert_eq!(variants, None);
+            }
+        }
+    }
+
+    #[test]
+    fn switch_case_variants_do_not_charge_repeated_types() {
+        let db = TestDb::default();
+        let chain = typeof_chain(&db, MAX_TYPE_VARIANT_STEPS - 1);
+        let repeated = TypeData::Union(InternedUnion::new(
+            &db,
+            vec![chain; MAX_TYPE_VARIANT_STEPS + 1].into_boxed_slice(),
+        ));
+
+        assert_eq!(
+            InferredType::new(&db, repeated).try_switch_case_variants(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn switch_case_variants_terminate_on_cycles() {
+        let db = TestDb::default();
+        // The first interned value receives index zero, so its child points back to itself.
+        let self_reference = InternedTypeofType::from_id(unsafe { salsa::Id::from_index(0) });
+        let cycle = TypeData::TypeofType(InternedTypeofType::new(
+            &db,
+            TypeData::TypeofType(self_reference),
+        ));
+
+        assert_eq!(
+            InferredType::new(&db, cycle).try_switch_case_variants(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn promise_inheritance_boundaries_are_tristate() {
+        let db = TestDb::default();
+
+        for steps in [63, 64, 65] {
+            let expected = (steps <= 64).then_some(true);
+            assert_eq!(
+                is_promise_instance(&db, promise_class_chain(&db, steps)),
+                expected,
+                "Promise inheritance steps {steps}"
+            );
+            assert_eq!(
+                is_promise_instance(&db, promise_like_interface_chain(&db, steps)),
+                expected,
+                "PromiseLike inheritance steps {steps}"
+            );
+        }
+    }
+
+    #[test]
+    fn promise_status_rejects_over_budget_union_frontier() {
+        let db = TestDb::default();
+        let union = TypeData::Union(InternedUnion::new(
+            &db,
+            vec![TypeData::Number; MAX_PROMISE_TYPE_STEPS + 1].into_boxed_slice(),
+        ));
+
+        assert_eq!(is_promise_instance(&db, union), None);
+    }
+
+    #[test]
+    fn promise_status_distinguishes_completion_cycles_and_union_poisoning() {
+        let db = TestDb::default();
+        assert_eq!(is_promise_instance(&db, TypeData::Number), Some(false));
+
+        let self_reference = InternedClass::from_id(unsafe { salsa::Id::from_index(0) });
+        let cycle = TypeData::InstanceOf(InternedTypeInstance::new(
+            &db,
+            TypeData::Class(InternedClass::new(
+                &db,
+                Box::default(),
+                Some(TypeData::Class(self_reference)),
+                Box::default(),
+                Box::default(),
+                None,
+            )),
+            Box::default(),
+        ));
+        assert_eq!(is_promise_instance(&db, cycle), None);
+
+        let promise = TypeData::promise_instance(&db, Box::new([TypeData::Number]));
+        for types in [
+            Vec::from([TypeData::Number, TypeData::Unknown]),
+            Vec::from([TypeData::Unknown, TypeData::Number]),
+        ] {
+            let union = TypeData::Union(InternedUnion::new(&db, types.into_boxed_slice()));
+            assert_eq!(is_promise_instance(&db, union), None);
+        }
+        for types in [
+            Vec::from([promise, TypeData::Unknown]),
+            Vec::from([TypeData::Unknown, promise]),
+        ] {
+            let union = TypeData::Union(InternedUnion::new(&db, types.into_boxed_slice()));
+            assert_eq!(is_promise_instance(&db, union), Some(true));
+        }
+
+        let function = TypeData::Function(InternedFunction::new(
+            &db,
+            Box::default(),
+            Box::default(),
+            ReturnType::Type(TypeData::Unknown),
+            false,
+            None,
+        ));
+        assert_eq!(
+            InferredType::new(&db, function).function_returns_promise(),
+            None
+        );
+        let array = TypeData::instance_of(
+            &db,
+            TypeData::GlobalType(crate::globals_ids::ARRAY_ID_GLOBAL_TYPE_ID),
+            Box::new([TypeData::Unknown]),
+        );
+        assert_eq!(InferredType::new(&db, array).is_array_of_promise(), None);
+    }
+
+    #[test]
+    fn promise_status_is_repeatable_and_invalidates() {
+        let mut db = TestDb::default();
+        let input = PromiseChainSteps::new(&db, 65);
+        assert_eq!(promise_chain_status(&db, input), None);
+        assert_eq!(promise_chain_status(&db, input), None);
+
+        salsa::Setter::to(input.set_steps(&mut db), 64);
+        assert_eq!(promise_chain_status(&db, input), Some(true));
+        assert_eq!(promise_chain_status(&db, input), Some(true));
     }
 }

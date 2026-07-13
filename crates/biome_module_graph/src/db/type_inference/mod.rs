@@ -1,10 +1,18 @@
+//! Database-backed JavaScript and TypeScript type inference.
+//!
+//! Every potentially cyclic or expanding walk has a deterministic query-local
+//! budget. Exhaustion degrades to `Unknown` or `None`; deduplicated revisits do
+//! not consume additional budget.
+
 #![deny(clippy::wildcard_enum_match_arm)]
 
+use crate::db::queries::NormalizeTypeInput;
+use crate::db::type_inference::globals::global_type;
 use crate::module_graph::{ModuleInfo, ModuleInfoKind};
 use crate::{JsExport, JsOwnExport, ModuleDb, ResolvedPath};
 use biome_css_syntax::TextRange;
-use biome_js_type_info::interned_types::{
-    LocalTypeId, ModuleKey, StructuralMapError, TypeData as InferredTypeData,
+use biome_js_type_info::resolved::{
+    InferredLocalTypeId, InferredModuleKey, InferredTypeData, StructuralMapError,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::ControlFlow;
@@ -22,56 +30,85 @@ mod resolver;
 pub(in crate::db) use lookup::{apply_substitutions_to_root_body, substitutions_for_instance};
 pub(in crate::db) use resolver::{ImportResolution, resolve_raw_types};
 
+/// Type metadata for a binding.
+///
+/// This remains a wrapper because it is part of the public
+/// [`InferredModuleTypes::binding_type_data`] value shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, salsa::Update)]
 pub struct BindingTypeData<'db> {
     pub ty: InferredTypeData<'db>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Inferred type information for a single module.
+///
+/// It stores the types discovered for declarations, expressions, and bindings
+/// while preserving the module identity needed to interpret local type IDs.
 pub struct InferredModuleTypes<'db> {
-    pub module_key: ModuleKey,
-    pub named_type_ids: Box<[LocalTypeId]>,
+    /// Identifies the module that owns the local type IDs in this result.
+    pub module_key: InferredModuleKey,
+    /// Local type IDs that belong to named type declarations.
+    pub named_type_ids: Box<[InferredLocalTypeId]>,
+    /// Inferred types indexed by their local type ID.
     pub types: Box<[InferredTypeData<'db>]>,
+    /// Inferred expression types indexed by their source ranges.
     pub expressions: FxHashMap<TextRange, InferredTypeData<'db>>,
+    /// Inferred binding types indexed by their source ranges.
     pub binding_type_data: FxHashMap<TextRange, BindingTypeData<'db>>,
 }
 
-// SAFETY: This struct does not borrow from the database. It owns the ranges, and
-// the types are small handles created by Salsa. Comparing the old maps with the
-// new maps is safe; if they differ, replacing the old maps exposes the same data
-// as updating each entry one by one.
+// SAFETY: `infer_module_types` returns this aggregate from a tracked query. The
+// aggregate owns its containers and
+// contains only Salsa handles, whose `Update` implementations perform the
+// required cross-revision transition. Each field update delegates equality and
+// replacement to those implementations, so old-revision handles are never
+// compared directly with handles from the new revision.
 unsafe impl salsa::Update for InferredModuleTypes<'_> {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        let old_value = unsafe { &mut *old_pointer };
-        if *old_value == new_value {
-            false
-        } else {
-            *old_value = new_value;
-            true
-        }
+        let Self {
+            module_key,
+            named_type_ids,
+            types,
+            expressions,
+            binding_type_data,
+        } = new_value;
+        let mut changed = false;
+        changed |=
+            unsafe { salsa::Update::maybe_update(&raw mut (*old_pointer).module_key, module_key) };
+        changed |= unsafe {
+            salsa::Update::maybe_update(&raw mut (*old_pointer).named_type_ids, named_type_ids)
+        };
+        changed |= unsafe { salsa::Update::maybe_update(&raw mut (*old_pointer).types, types) };
+        changed |=
+            unsafe { maybe_update_range_map(&raw mut (*old_pointer).expressions, expressions) };
+        changed |= unsafe {
+            maybe_update_range_map(&raw mut (*old_pointer).binding_type_data, binding_type_data)
+        };
+        changed
     }
 }
 
-impl<'db> InferredModuleTypes<'db> {
-    pub fn resolve_type(
-        &self,
-        db: &'db dyn ModuleDb,
-        ty: InferredTypeData<'db>,
-    ) -> InferredTypeData<'db> {
-        self.resolve_type_iterative(db, ty)
+unsafe fn maybe_update_range_map<V: salsa::Update>(
+    old_pointer: *mut FxHashMap<TextRange, V>,
+    new_map: FxHashMap<TextRange, V>,
+) -> bool {
+    let old_map = unsafe { &mut *old_pointer };
+    if old_map.len() != new_map.len() || old_map.keys().any(|key| !new_map.contains_key(key)) {
+        *old_map = new_map;
+        return true;
     }
 
-    pub fn find_member_type(
-        &self,
-        db: &'db dyn ModuleDb,
-        ty: InferredTypeData<'db>,
-        name: &str,
-    ) -> Option<InferredTypeData<'db>> {
-        self.find_member_type_iterative(db, ty, name)
+    let mut changed = false;
+    for (key, new_value) in new_map {
+        let old_value = old_map
+            .get_mut(&key)
+            .expect("range keys were checked above");
+        changed |= unsafe { V::maybe_update(old_value, new_value) };
     }
+    changed
 }
 
-pub(super) fn collected_type_result<'db>(
+pub(in crate::db) fn collected_type_result<'db>(
     db: &'db dyn ModuleDb,
     types: Vec<InferredTypeData<'db>>,
 ) -> Option<InferredTypeData<'db>> {
@@ -79,6 +116,72 @@ pub(super) fn collected_type_result<'db>(
         None
     } else {
         Some(InferredTypeData::union_from_types(db, types))
+    }
+}
+
+/// Expands a canonical global handle to the exact type stored in the database.
+///
+/// Use this for identity-aware operations such as direct member lookup.
+fn expand_canonical_global<'db>(
+    db: &'db dyn ModuleDb,
+    ty: InferredTypeData<'db>,
+) -> InferredTypeData<'db> {
+    if let InferredTypeData::GlobalType(id) = ty {
+        global_type(db, id)
+    } else {
+        ty
+    }
+}
+
+/// Expands only globals whose result is safe to use structurally.
+///
+/// Nominal classes and interfaces remain canonical handles so identity checks,
+/// including Promise-class recognition, continue to observe the global ID.
+fn expand_structural_global<'db>(
+    db: &'db dyn ModuleDb,
+    ty: InferredTypeData<'db>,
+) -> InferredTypeData<'db> {
+    let InferredTypeData::GlobalType(id) = ty else {
+        return ty;
+    };
+    match global_type(db, id) {
+        InferredTypeData::Class(_)
+        | InferredTypeData::Interface(_)
+        | InferredTypeData::Module(_)
+        | InferredTypeData::Namespace(_)
+        | InferredTypeData::Object(_) => ty,
+        expanded @ (InferredTypeData::Unknown
+        | InferredTypeData::Divergent(_)
+        | InferredTypeData::Global
+        | InferredTypeData::GlobalType(_)
+        | InferredTypeData::BigInt
+        | InferredTypeData::Boolean
+        | InferredTypeData::Null
+        | InferredTypeData::Number
+        | InferredTypeData::String
+        | InferredTypeData::Symbol
+        | InferredTypeData::Undefined
+        | InferredTypeData::Conditional
+        | InferredTypeData::Constructor(_)
+        | InferredTypeData::Function(_)
+        | InferredTypeData::Tuple(_)
+        | InferredTypeData::Generic(_)
+        | InferredTypeData::Local(_)
+        | InferredTypeData::Intersection(_)
+        | InferredTypeData::Union(_)
+        | InferredTypeData::TypeOperator(_)
+        | InferredTypeData::Literal(_)
+        | InferredTypeData::InstanceOf(_)
+        | InferredTypeData::MergedReference(_)
+        | InferredTypeData::TypeofExpression(_)
+        | InferredTypeData::TypeofType(_)
+        | InferredTypeData::TypeofValue(_)
+        | InferredTypeData::AnyKeyword
+        | InferredTypeData::NeverKeyword
+        | InferredTypeData::ObjectKeyword
+        | InferredTypeData::ThisKeyword
+        | InferredTypeData::UnknownKeyword
+        | InferredTypeData::VoidKeyword) => expanded,
     }
 }
 
@@ -92,6 +195,7 @@ pub(in crate::db) fn normalize_structural_type<'db>(
         MAX_TYPE_NORMALIZATION_STEPS,
         |ty| {
             let ty = resolve_local(ty);
+            let ty = expand_structural_global(db, ty);
             if let InferredTypeData::TypeofValue(value) = ty
                 && value.ty(db) == InferredTypeData::Unknown
             {
@@ -120,6 +224,7 @@ pub(in crate::db) fn normalize_structural_type<'db>(
             ty @ (InferredTypeData::Unknown
             | InferredTypeData::Divergent(_)
             | InferredTypeData::Global
+            | InferredTypeData::GlobalType(_)
             | InferredTypeData::BigInt
             | InferredTypeData::Boolean
             | InferredTypeData::Null
@@ -154,7 +259,7 @@ pub(in crate::db) fn normalize_structural_type<'db>(
     )
 }
 
-pub(super) fn infer_module_types_cycle_result<'db>(
+pub(in crate::db) fn infer_module_types_cycle_result<'db>(
     db: &'db dyn ModuleDb,
     _id: salsa::Id,
     module: ModuleInfo,
@@ -176,15 +281,30 @@ pub(super) fn infer_module_types_cycle_result<'db>(
 }
 
 fn inference_scc(db: &dyn ModuleDb, root: ModuleInfo) -> FxHashSet<ModuleInfo> {
+    const MAX_DEPENDENCY_STEPS: usize = 1024;
+
+    // Salsa invokes this from the cycle fallback. The first pass records every
+    // dependency reachable from the root and builds reverse edges; the second
+    // walks predecessors back to the root, retaining only its strongly
+    // connected component for CycleFallback import suppression.
     let mut reachable = FxHashSet::default();
     let mut reverse = FxHashMap::<ModuleInfo, Vec<ModuleInfo>>::default();
     let mut pending = vec![root];
+    let mut remaining_dependency_steps = MAX_DEPENDENCY_STEPS;
     reachable.insert(root);
 
     while let Some(source) = pending.pop() {
+        db.unwind_if_revision_cancelled();
         for target in inferable_dependencies(db, source) {
             reverse.entry(target).or_default().push(source);
             if reachable.insert(target) {
+                if remaining_dependency_steps == 0 {
+                    // The search cannot determine the exact cycle within its
+                    // step limit. Block every dependency found so far to avoid
+                    // starting another long inference chain from the fallback.
+                    return reachable;
+                }
+                remaining_dependency_steps -= 1;
                 pending.push(target);
             }
         }
@@ -192,11 +312,17 @@ fn inference_scc(db: &dyn ModuleDb, root: ModuleInfo) -> FxHashSet<ModuleInfo> {
 
     let mut scc = FxHashSet::default();
     let mut pending = vec![root];
+    let mut remaining_dependency_steps = MAX_DEPENDENCY_STEPS;
     scc.insert(root);
     while let Some(target) = pending.pop() {
+        db.unwind_if_revision_cancelled();
         if let Some(predecessors) = reverse.get(&target) {
             for predecessor in predecessors {
                 if scc.insert(*predecessor) {
+                    if remaining_dependency_steps == 0 {
+                        return scc;
+                    }
+                    remaining_dependency_steps -= 1;
                     pending.push(*predecessor);
                 }
             }
@@ -247,10 +373,10 @@ fn inferable_dependencies(db: &dyn ModuleDb, module: ModuleInfo) -> Vec<ModuleIn
     dependencies
 }
 
-pub(super) fn normalize_type_cycle_result<'db>(
+pub(in crate::db) fn normalize_type_cycle_result<'db>(
     _db: &'db dyn ModuleDb,
     _id: salsa::Id,
-    _input: crate::db::queries::NormalizeTypeInput<'db>,
+    _input: NormalizeTypeInput<'db>,
 ) -> InferredTypeData<'db> {
     InferredTypeData::Unknown
 }

@@ -108,7 +108,7 @@ impl Rule for NoMisusedPromises {
 
     fn run(ctx: &RuleContext<Self>) -> Self::Signals {
         let expression = ctx.query();
-        let ty = ctx.inferred_type_of_expression(expression)?;
+        let ty = ctx.type_of_expression(expression)?;
         if ty.is_function() {
             find_misused_promise_returning_callback(ctx, expression, ty)
         } else {
@@ -229,10 +229,7 @@ fn find_misused_promise_expression(
         _ => return None,
     };
 
-    // Uncomment the following line for debugging convenience:
-    //let printed = format!("type of {expression:?} = {ty:?}");
-    let should_signal = ty.is_promise_instance() || ty.has_promise_variant();
-    should_signal.then_some(state)
+    (ty.is_promise_instance() == Some(true)).then_some(state)
 }
 
 fn find_misused_promise_returning_callback(
@@ -240,7 +237,7 @@ fn find_misused_promise_returning_callback(
     expression: &AnyJsExpression,
     ty: InferredType,
 ) -> Option<NoMisusedPromisesState> {
-    if !ty.function_returns_promise() {
+    if ty.function_returns_promise() != Some(true) {
         return None;
     }
 
@@ -259,8 +256,9 @@ fn find_misused_promise_returning_callback(
         .skip(1)
         .find_map(JsCallExpression::cast)
     {
-        ctx.inferred_expected_argument_type(
+        ctx.expected_argument_type(
             &call_expression.callee().ok()?,
+            &argument_list,
             argument_index,
             false,
         )?
@@ -270,8 +268,9 @@ fn find_misused_promise_returning_callback(
         .skip(1)
         .find_map(JsNewExpression::cast)
     {
-        ctx.inferred_expected_argument_type(
+        ctx.expected_argument_type(
             &new_expression.callee().ok()?,
+            &argument_list,
             argument_index,
             true,
         )?

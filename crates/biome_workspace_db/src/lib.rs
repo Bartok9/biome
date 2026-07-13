@@ -9,8 +9,8 @@ use biome_languages::DocumentFileSource;
 use biome_languages::LanguageDb;
 #[cfg(feature = "module_graph")]
 use biome_module_graph::{
-    LocalTypeId, ModuleDb, ModuleGraphGeneration, ModuleInfo, ModuleInfoKind, ModuleInfoOrigin,
-    ModuleKey, TypeDb,
+    InferredLocalTypeId, InferredModuleKey, ModuleDb, ModuleGraphGeneration, ModuleInfo,
+    ModuleInfoKind, ModuleInfoOrigin, TypeDb, module_for_key,
 };
 use biome_parser::AnyParse;
 use biome_rowan::SendNode;
@@ -18,15 +18,17 @@ use biome_rowan::SendNode;
 use biome_rowan::Text;
 use camino::{Utf8Path, Utf8PathBuf};
 use papaya::HashMap;
-#[cfg(feature = "module_graph")]
-use salsa::plumbing::{AsId, FromId};
 use salsa::{Setter, Storage};
 use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParsedSourceUpdateMode {
+    /// Mint a new Salsa input and replace the path mapping. Existing handles no
+    /// longer identify the file stored at that path.
     Replace,
+    /// Mutate an existing Salsa input in place. The handle remains stable, but
+    /// setters wait until no live database clone is reading the old revision.
     Setters,
 }
 
@@ -40,7 +42,7 @@ pub struct WorkspaceDb {
     files: Arc<HashMap<Utf8PathBuf, ParsedSource>>,
     /// It maps a file path to its module graph representation
     #[cfg(feature = "module_graph")]
-    pub modules: Arc<HashMap<Utf8PathBuf, ModuleInfo>>,
+    modules: Arc<HashMap<Utf8PathBuf, ModuleInfo>>,
     /// It stores the file sources across projects.
     file_sources: Arc<boxcar::Vec<DocumentFileSource>>,
     // NOTE: this must stay last as per salsa restrictions.
@@ -96,6 +98,14 @@ impl WorkspaceDbData {
             )
     }
 
+    /// Checks whether the shared module map currently contains `path`.
+    ///
+    /// Use this for decisions such as skipping a file the scanner has already
+    /// indexed.
+    ///
+    /// Do not use this inside a Salsa query or before reading module contents.
+    /// Use [`ModuleDb::module_for_path`] instead so Salsa reruns the query when
+    /// the module graph changes.
     #[cfg(feature = "module_graph")]
     pub fn contains_module_untracked(&self, path: &Utf8Path) -> bool {
         self.modules.pin().contains_key(path)
@@ -104,10 +114,16 @@ impl WorkspaceDbData {
 
 impl WorkspaceDb {
     #[cfg(feature = "module_graph")]
-    fn bump_module_graph_generation(&mut self) {
+    fn mutate_modules(&mut self, mutate: impl FnOnce(&HashMap<Utf8PathBuf, ModuleInfo>)) {
         let generation = ModuleGraphGeneration::get(self);
         let next = generation.value(self).wrapping_add(1);
-        generation.set_value(self).to(next);
+        let modules = self.modules.clone();
+
+        // Begin the Salsa write before mutating the shared registry, then publish
+        // the new generation only after the registry mutation is complete.
+        let pending_setter = generation.set_value(self);
+        mutate(&modules);
+        pending_setter.to(next);
     }
 
     /// Returns handles to the collections that this database shares with all
@@ -128,14 +144,18 @@ impl WorkspaceDb {
         self.data().insert_source(document_file_source)
     }
 
+    /// Replaces the path mapping with the provided input handle.
     pub fn insert_file(&mut self, path: &Utf8Path, file: ParsedSource) {
         self.files.pin().insert(path.to_path_buf(), file);
     }
 
+    /// Replaces the path mapping with the provided input handle.
     pub fn update_file(&mut self, path: &Utf8Path, file: ParsedSource) {
         self.files.pin().update(path.to_path_buf(), |_| file);
     }
 
+    /// Updates a file according to `mode`, preserving the handle only for
+    /// [`ParsedSourceUpdateMode::Setters`].
     pub fn update_file_with_mode(
         &mut self,
         path: &Utf8Path,
@@ -148,6 +168,7 @@ impl WorkspaceDb {
         self.update_or_insert_file(path, parsed, document_source_index, snippets, mode)
     }
 
+    /// Mints a new input and replaces the path mapping (`Replace` semantics).
     pub fn replace_file(
         &mut self,
         path: &Utf8Path,
@@ -166,6 +187,8 @@ impl WorkspaceDb {
         file
     }
 
+    /// Mutates an existing input in place, or mints one if absent (`Setters`
+    /// semantics).
     pub fn upsert_file(
         &mut self,
         path: &Utf8Path,
@@ -182,6 +205,8 @@ impl WorkspaceDb {
         )
     }
 
+    /// Applies the selected replacement or setter semantics and returns the
+    /// handle now mapped to `path`.
     pub fn update_or_insert_file(
         &mut self,
         path: &Utf8Path,
@@ -209,7 +234,7 @@ impl WorkspaceDb {
     }
 
     #[cfg(feature = "module_graph")]
-    pub fn get_module(&self, path: &Utf8Path) -> Option<ModuleInfo> {
+    fn get_module(&self, path: &Utf8Path) -> Option<ModuleInfo> {
         self.modules.pin().get(path).copied()
     }
 
@@ -237,8 +262,9 @@ impl WorkspaceDb {
             ModuleInfoOrigin::Published,
             "detached modules must not be inserted into the shared module registry"
         );
-        self.modules.pin().insert(path, module);
-        self.bump_module_graph_generation();
+        self.mutate_modules(|modules| {
+            modules.pin().insert(path, module);
+        });
     }
 
     #[cfg(feature = "module_graph")]
@@ -292,26 +318,32 @@ impl WorkspaceDb {
 
     #[cfg(feature = "module_graph")]
     pub fn remove_module(&mut self, path: &Utf8Path) {
-        if self.modules.pin().remove(path).is_some() {
-            self.bump_module_graph_generation();
+        if self.modules.pin().contains_key(path) {
+            self.mutate_modules(|modules| {
+                let modules = modules.pin();
+                let removed = modules.remove(path);
+                debug_assert!(removed.is_some());
+            });
         }
     }
 
     pub fn unload_path(&mut self, path: &Utf8Path) {
         #[cfg(feature = "module_graph")]
         {
-            let modules = self.modules.pin();
-            let to_remove = modules
+            let to_remove = self
+                .modules
+                .pin()
                 .keys()
                 .filter(|module_path| module_path.starts_with(path))
                 .cloned()
                 .collect::<Vec<_>>();
-            for module_path in &to_remove {
-                modules.remove(module_path);
-            }
-            drop(modules);
             if !to_remove.is_empty() {
-                self.bump_module_graph_generation();
+                self.mutate_modules(|modules| {
+                    let modules = modules.pin();
+                    for module_path in &to_remove {
+                        modules.remove(module_path);
+                    }
+                });
             }
         }
         #[cfg(not(feature = "module_graph"))]
@@ -376,18 +408,12 @@ impl biome_db::Db for WorkspaceDb {
 #[cfg(feature = "module_graph")]
 #[salsa::db]
 impl TypeDb for WorkspaceDb {
-    fn local_type_name(&self, module_key: ModuleKey, type_id: LocalTypeId) -> Option<Text> {
-        let module = ModuleInfo::from_id(module_key.as_id());
-        if module.origin(self) == ModuleInfoOrigin::Detached {
-            let ModuleInfoKind::Js(info) = module.kind(self) else {
-                return None;
-            };
-            return info.local_type_name(type_id);
-        }
-        let current = self.module_for_path(module.path(self))?;
-        if ModuleKey::new(current.as_id()) != module_key {
-            return None;
-        }
+    fn local_type_name(
+        &self,
+        module_key: InferredModuleKey,
+        type_id: InferredLocalTypeId,
+    ) -> Option<Text> {
+        let current = module_for_key(self, module_key)?;
 
         let ModuleInfoKind::Js(info) = current.kind(self) else {
             return None;
@@ -433,10 +459,20 @@ impl LanguageDb for WorkspaceDb {
 mod tests {
     use super::*;
     use biome_db::Db;
+    #[cfg(feature = "module_graph")]
+    use biome_fs::{BiomePath, MemoryFileSystem};
+    #[cfg(feature = "module_graph")]
+    use biome_html_parser::{HtmlParserOptions, parse_html};
     use biome_js_parser::{JsParserOptions, parse};
     use biome_languages::JsFileSource;
+    #[cfg(feature = "module_graph")]
+    use biome_module_graph::{ModuleDb, PathInfoCache, resolve_html_module};
+    #[cfg(feature = "module_graph")]
+    use biome_project_layout::ProjectLayout;
     use salsa::plumbing::AsId;
     use std::sync::Barrier;
+    #[cfg(feature = "module_graph")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -449,6 +485,45 @@ mod tests {
             JsParserOptions::default(),
         )
         .into()
+    }
+
+    #[cfg(feature = "module_graph")]
+    fn module_transaction_db(barrier: Arc<Barrier>, armed: Arc<AtomicBool>) -> WorkspaceDb {
+        let storage = Storage::new(Some(Box::new(move |event| {
+            if armed.load(Ordering::Acquire)
+                && matches!(event.kind, salsa::EventKind::DidSetCancellationFlag)
+            {
+                barrier.wait();
+            }
+        })));
+        let db = WorkspaceDb {
+            files: Arc::default(),
+            modules: Arc::default(),
+            file_sources: Arc::default(),
+            storage,
+        };
+        ModuleGraphGeneration::new(&db, 0);
+        db
+    }
+
+    #[cfg(feature = "module_graph")]
+    fn test_module(db: &WorkspaceDb, path: &str) -> ModuleInfo {
+        let path = BiomePath::new(path);
+        let fs = MemoryFileSystem::default();
+        let root = parse_html("", HtmlParserOptions::default()).tree();
+        let (module, _, _) = resolve_html_module(
+            root,
+            &[],
+            &path,
+            &fs,
+            &ProjectLayout::default(),
+            &PathInfoCache::default(),
+        );
+        ModuleInfo::new_published(
+            db,
+            path.as_path().to_path_buf(),
+            ModuleInfoKind::Html(module),
+        )
     }
 
     #[salsa::tracked]
@@ -521,5 +596,135 @@ mod tests {
                 "{result:?}"
             );
         });
+    }
+
+    #[cfg(feature = "module_graph")]
+    #[test]
+    fn module_insertion_publishes_after_generation_invalidation() {
+        let barrier = Arc::new(Barrier::new(2));
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut db = module_transaction_db(barrier.clone(), armed.clone());
+        let path = Utf8PathBuf::from("inserted.html");
+        let module = test_module(&db, path.as_str());
+        let old_generation = db.module_graph_generation();
+        let reader_db = db.clone();
+        armed.store(true, Ordering::Release);
+
+        let db = std::thread::scope(|scope| {
+            let writer_path = path.clone();
+            let writer = scope.spawn(move || {
+                db.insert_module(writer_path, module);
+                db
+            });
+
+            barrier.wait();
+            assert_eq!(reader_db.module_graph_generation(), old_generation);
+            assert!(reader_db.module_for_path(&path).is_none());
+            drop(reader_db);
+
+            writer.join().unwrap()
+        });
+
+        assert_eq!(db.module_graph_generation(), old_generation.wrapping_add(1));
+        assert_eq!(
+            db.module_for_path(&path).map(|module| module.as_id()),
+            Some(module.as_id())
+        );
+    }
+
+    #[cfg(feature = "module_graph")]
+    #[test]
+    fn module_removal_publishes_after_generation_invalidation() {
+        let barrier = Arc::new(Barrier::new(2));
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut db = module_transaction_db(barrier.clone(), armed.clone());
+        let path = Utf8PathBuf::from("removed.html");
+        let module = test_module(&db, path.as_str());
+        db.insert_module(path.clone(), module);
+        let old_generation = db.module_graph_generation();
+        let reader_db = db.clone();
+        armed.store(true, Ordering::Release);
+
+        let db = std::thread::scope(|scope| {
+            let writer_path = path.clone();
+            let writer = scope.spawn(move || {
+                db.remove_module(&writer_path);
+                db
+            });
+
+            barrier.wait();
+            assert_eq!(reader_db.module_graph_generation(), old_generation);
+            assert_eq!(
+                reader_db
+                    .module_for_path(&path)
+                    .map(|module| module.as_id()),
+                Some(module.as_id())
+            );
+            drop(reader_db);
+
+            writer.join().unwrap()
+        });
+
+        assert_eq!(db.module_graph_generation(), old_generation.wrapping_add(1));
+        assert!(db.module_for_path(&path).is_none());
+    }
+
+    #[cfg(feature = "module_graph")]
+    #[test]
+    fn module_unload_publishes_after_generation_invalidation() {
+        let barrier = Arc::new(Barrier::new(2));
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut db = module_transaction_db(barrier.clone(), armed.clone());
+        let root = Utf8PathBuf::from("root/a.html");
+        let nested = Utf8PathBuf::from("root/nested/b.html");
+        let outside = Utf8PathBuf::from("other/c.html");
+        let root_module = test_module(&db, root.as_str());
+        let nested_module = test_module(&db, nested.as_str());
+        let outside_module = test_module(&db, outside.as_str());
+        db.insert_module(root.clone(), root_module);
+        db.insert_module(nested.clone(), nested_module);
+        db.insert_module(outside.clone(), outside_module);
+        let old_generation = db.module_graph_generation();
+        let reader_db = db.clone();
+        armed.store(true, Ordering::Release);
+
+        let db = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                db.unload_path(Utf8Path::new("root"));
+                db
+            });
+
+            barrier.wait();
+            assert_eq!(reader_db.module_graph_generation(), old_generation);
+            assert_eq!(
+                reader_db
+                    .module_for_path(&root)
+                    .map(|module| module.as_id()),
+                Some(root_module.as_id())
+            );
+            assert_eq!(
+                reader_db
+                    .module_for_path(&nested)
+                    .map(|module| module.as_id()),
+                Some(nested_module.as_id())
+            );
+            assert_eq!(
+                reader_db
+                    .module_for_path(&outside)
+                    .map(|module| module.as_id()),
+                Some(outside_module.as_id())
+            );
+            drop(reader_db);
+
+            writer.join().unwrap()
+        });
+
+        assert_eq!(db.module_graph_generation(), old_generation.wrapping_add(1));
+        assert!(db.module_for_path(&root).is_none());
+        assert!(db.module_for_path(&nested).is_none());
+        assert_eq!(
+            db.module_for_path(&outside).map(|module| module.as_id()),
+            Some(outside_module.as_id())
+        );
     }
 }

@@ -1,7 +1,7 @@
 #[cfg(not(feature = "module_graph"))]
 use crate::module_graph::PathInfoCache;
 #[cfg(feature = "module_graph")]
-use crate::module_graph::{ModuleInfo, ModuleInfoKind, PathInfoCache};
+use crate::module_graph::{ModuleDb, ModuleInfo, ModuleInfoKind, PathInfoCache};
 use biome_db::{ParsedSnippet, ParsedSource};
 use biome_languages::DocumentFileSource;
 use biome_parser::AnyParse;
@@ -237,7 +237,7 @@ impl DbState {
     #[cfg(feature = "module_graph")]
     pub(crate) fn contains_module_untracked(&self, path: &Utf8Path) -> bool {
         match &self.storage {
-            DbStorage::Shared(shared_db) => shared_db.fork().get_module(path).is_some(),
+            DbStorage::Shared(shared_db) => shared_db.fork().module_for_path(path).is_some(),
             DbStorage::Owned(db) => db.data.contains_module_untracked(path),
         }
     }
@@ -277,7 +277,7 @@ impl DbState {
     pub(crate) fn unload_path(&self, path: &Utf8Path) {
         match &self.storage {
             DbStorage::Shared(shared_db) => shared_db.fork().unload_path(path),
-            DbStorage::Owned(db) => db.data.unload_path(path),
+            DbStorage::Owned(db) => db.with_setter(|db| db.unload_path(path)),
         }
     }
 
@@ -289,8 +289,8 @@ impl DbState {
     ) -> ModuleInfo {
         match &self.storage {
             DbStorage::Shared(shared_db) => {
-                let db = shared_db.fork();
-                let module = ModuleInfo::new(&db, path.clone(), kind);
+                let mut db = shared_db.fork();
+                let module = ModuleInfo::new_published(&db, path.clone(), kind);
                 db.insert_module(path, module);
                 module
             }
@@ -302,7 +302,7 @@ impl DbState {
     pub(crate) fn remove_module(&self, path: &Utf8Path) {
         match &self.storage {
             DbStorage::Shared(shared_db) => shared_db.fork().remove_module(path),
-            DbStorage::Owned(db) => db.data.remove_module(path),
+            DbStorage::Owned(db) => db.with_setter(|db| db.remove_module(path)),
         }
     }
 
