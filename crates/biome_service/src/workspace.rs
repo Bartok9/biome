@@ -1725,9 +1725,8 @@ pub trait Workspace: Send + Sync + RefUnwindSafe {
     fn change_file(&self, params: ChangeFileParams) -> Result<ChangeFileResult, WorkspaceError>;
 
     /// Processes a file by applying linting, formatting, and assist without changing the open workspace document.
-    /// This is a stateless operation, which means that the new document, after the fixes/fomatting, isn't saved in the workspace.
+    /// This is a stateless operation, which means that the new document, after the fixes/formatting, isn't saved in the workspace.
     fn process_file(&self, params: ProcessFileParams) -> Result<ProcessFileResult, WorkspaceError>;
-
     /// Retrieves the list of diagnostics associated with a file.
     fn pull_diagnostics(
         &self,
