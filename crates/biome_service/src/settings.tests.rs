@@ -1,6 +1,6 @@
 use crate::scanner::ScanKind;
 use crate::settings::{
-    LanguageSettings, ModuleGraphResolutionKind, ServiceLanguage, Settings,
+    LanguageSettings, ModuleGraphResolutionKind, ServiceLanguage, Settings, VcsSettings,
     to_json_language_settings,
 };
 use biome_analyze::RuleFilter;
@@ -9,6 +9,7 @@ use biome_configuration::html::{HtmlConfiguration, HtmlParserConfiguration};
 use biome_configuration::javascript::{JsResolverConfiguration, JsxRuntime};
 use biome_configuration::json::{JsonAssistConfiguration, JsonLinterConfiguration};
 use biome_configuration::max_size::MaxSize;
+use biome_configuration::vcs::{VcsClientKind, VcsEnabled, VcsUseIgnoreFile};
 use biome_configuration::{
     Configuration, FormatterConfiguration, JsConfiguration, JsonConfiguration, LinterConfiguration,
     OverrideFilesConfiguration, OverrideGlobs, OverrideLinterConfiguration, OverridePattern,
@@ -397,4 +398,69 @@ fn assert_no_parse_diagnostics(source: &str, options: HtmlParserOptions) {
         "expected parsing to succeed, got diagnostics: {:?}",
         parse.diagnostics()
     );
+}
+
+fn enabled_git_vcs_settings() -> VcsSettings {
+    VcsSettings {
+        client_kind: Some(VcsClientKind::Git),
+        enabled: Some(VcsEnabled::from(true)),
+        use_ignore_file: Some(VcsUseIgnoreFile::from(true)),
+        ..VcsSettings::default()
+    }
+}
+
+#[test]
+fn vcs_ignores_files_below_ignored_directory() {
+    let mut vcs = enabled_git_vcs_settings();
+    vcs.store_root_ignore_patterns(Utf8Path::new("/project"), &["node_modules"])
+        .unwrap();
+
+    let path = Utf8Path::new("/project/apps/miniapp/node_modules/react-router/dist/index.js");
+    assert!(vcs.is_ignored(path, false, None));
+}
+
+#[test]
+fn vcs_nested_whitelist_overrides_root_ignore() {
+    let mut vcs = enabled_git_vcs_settings();
+    vcs.store_root_ignore_patterns(Utf8Path::new("/project"), &["*.log"])
+        .unwrap();
+    vcs.store_nested_ignore_patterns(Utf8Path::new("/project/subdir"), &["!important.log"])
+        .unwrap();
+
+    let path = Utf8Path::new("/project/subdir/important.log");
+    assert!(!vcs.is_ignored(path, false, None));
+}
+
+#[test]
+fn vcs_root_whitelist_keeps_path_included() {
+    let mut vcs = enabled_git_vcs_settings();
+    vcs.store_root_ignore_patterns(Utf8Path::new("/project"), &["/*", "!src"])
+        .unwrap();
+
+    let path = Utf8Path::new("/project/src/index.ts");
+    assert!(!vcs.is_ignored(path, false, None));
+}
+
+#[test]
+fn vcs_deeper_nested_overrides_shallower_nested() {
+    let mut vcs = enabled_git_vcs_settings();
+    vcs.store_root_ignore_patterns(Utf8Path::new("/project"), &[])
+        .unwrap();
+    vcs.store_nested_ignore_patterns(Utf8Path::new("/project/a"), &["important.log"])
+        .unwrap();
+    vcs.store_nested_ignore_patterns(Utf8Path::new("/project/a/b"), &["!important.log"])
+        .unwrap();
+
+    let path = Utf8Path::new("/project/a/b/important.log");
+    assert!(!vcs.is_ignored(path, false, None));
+}
+
+#[test]
+fn vcs_path_outside_repo_is_not_ignored() {
+    let mut vcs = enabled_git_vcs_settings();
+    vcs.store_root_ignore_patterns(Utf8Path::new("/project"), &["node_modules"])
+        .unwrap();
+
+    let path = Utf8Path::new("/elsewhere/src/index.ts");
+    assert!(!vcs.is_ignored(path, false, None));
 }
