@@ -1232,7 +1232,7 @@ pub enum VcsIgnoredPatterns {
 impl VcsIgnoredPatterns {
     /// Checks whether the path ignored by any ignore file found inside the project
     ///
-    /// The `root_path` represents the root of the project, as we want to match all ignore files untile the root.
+    /// The `root_path` represents the root of the project, as we want to match all ignore files until the root.
     pub fn is_ignored(&self, path: &Utf8Path, is_dir: bool, root_path: Option<&Utf8Path>) -> bool {
         match self {
             Self::Git { root, nested, .. } => {
