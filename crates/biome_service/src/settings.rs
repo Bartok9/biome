@@ -1190,7 +1190,7 @@ impl VcsSettings {
         })
     }
 
-    /// Checks where if the current file is a recognised file for the current VCS client
+    /// Checks whether the current file is a recognized ignore file for the current VCS client
     pub fn is_ignore_file(&self, path: &Utf8Path) -> bool {
         path.file_name().is_some_and(|file_name| {
             self.client_kind
