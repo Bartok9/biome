@@ -1,9 +1,9 @@
 use crate::run_cli;
 use crate::snap_test::{SnapshotPayload, assert_cli_snapshot};
 use biome_console::BufferConsole;
-use biome_fs::MemoryFileSystem;
+use biome_fs::{ErrorEntry, MemoryFileSystem};
 use bpaf::Args;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
 const MAIN_1: &str = r#"import { z} from "z"
 import { z, b , a} from "lodash"
@@ -200,6 +200,29 @@ fn reports_diagnostics_junit_check_command_file() {
     assert_cli_snapshot(SnapshotPayload::new(
         module_path!(),
         "reports_diagnostics_junit_check_command_file",
+        fs,
+        console,
+        result,
+    ));
+}
+
+#[test]
+fn reports_diagnostics_junit_check_command_no_span() {
+    let mut fs = MemoryFileSystem::default();
+    fs.insert_error(Utf8PathBuf::from("error.txt"), ErrorEntry::UnknownFileType);
+    let mut console = BufferConsole::default();
+
+    let (fs, result) = run_cli(
+        fs,
+        &mut console,
+        Args::from(["check", "--reporter=junit", "error.txt"].as_slice()),
+    );
+
+    assert!(result.is_err(), "run_cli returned {result:?}");
+
+    assert_cli_snapshot(SnapshotPayload::new(
+        module_path!(),
+        "reports_diagnostics_junit_check_command_no_span",
         fs,
         console,
         result,
