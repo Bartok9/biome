@@ -15,19 +15,19 @@ pub const IGNORE_FILE_NAME: &str = ".ignore";
 pub type VcsUseIgnoreFile = Bool<false>;
 pub type VcsEnabled = Bool<false>;
 
-/// Settings for integrating Biome with version control.
+/// Set of properties to integrate Biome with a VCS software.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Deserializable, Default, Merge)]
 #[cfg_attr(feature = "cli", derive(Bpaf))]
 #[deserializable(with_validator)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct VcsConfiguration {
-    /// Whether Biome should integrate with the version control client.
+    /// Whether Biome should integrate itself with the VCS client
     #[cfg_attr(feature = "cli", bpaf(long("vcs-enabled"), argument("true|false")))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<VcsEnabled>,
 
-    /// The version control client.
+    /// The kind of client.
     #[cfg_attr(
         feature = "cli",
         bpaf(long("vcs-client-kind"), argument("git"), optional)
@@ -36,8 +36,8 @@ pub struct VcsConfiguration {
     #[deserializable(bail_on_error)]
     pub client_kind: Option<VcsClientKind>,
 
-    /// When `true`, Biome ignores files listed in `.gitignore`, `.ignore`, and Git's local
-    /// exclude file.
+    /// Whether Biome should use VCS ignore files. When [true], Biome will ignore files
+    /// specified in `.gitignore`, `.ignore`, and Git's local exclude file.
     #[cfg_attr(
         feature = "cli",
         bpaf(long("vcs-use-ignore-file"), argument("true|false"))
@@ -45,18 +45,17 @@ pub struct VcsConfiguration {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_ignore_file: Option<VcsUseIgnoreFile>,
 
-    /// Sets the directory where Biome checks for version control files.
+    /// The folder where Biome should check for VCS files. By default, Biome will use the same
+    /// folder where `biome.json` was found.
     ///
-    /// Defaults to the directory containing `biome.json` or `biome.jsonc`. If no configuration is
-    /// found, Biome uses the current working directory.
-    ///
-    /// If neither directory is available, Biome disables version control integration and emits a
-    /// diagnostic.
+    /// If Biome can't find the configuration, it will attempt to use the current working directory.
+    /// If no current working directory can't be found, Biome won't use the VCS integration, and a diagnostic
+    /// will be emitted
     #[cfg_attr(feature = "cli", bpaf(long("vcs-root"), argument("PATH"), optional))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
 
-    /// The project's default branch.
+    /// The main branch of the project
     #[cfg_attr(
         feature = "cli",
         bpaf(long("vcs-default-branch"), argument("BRANCH"), optional)
@@ -115,7 +114,7 @@ impl DeserializableValidator for VcsConfiguration {
 #[serde(rename_all = "camelCase")]
 pub enum VcsClientKind {
     #[default]
-    /// Integration with Git as the version control client.
+    /// Integration with the git client as VCS
     Git,
 }
 
