@@ -91,39 +91,59 @@ impl ReporterVisitor for JunitReporterVisitor {
             status.set_message(message.clone());
 
             let location = diagnostic.location();
+            let category_name = diagnostic
+                .category()
+                .map(|c| c.name())
+                .unwrap_or_default()
+                .replace('/', ".");
+            let case_name = format!("org.biome.{category_name}");
 
-            if let (Some(span), Some(source_code), Some(resource)) =
-                (location.span, location.source_code, location.resource)
-            {
-                let source = SourceFile::new(source_code);
-                let start = source.location(span.start())?;
+            let Some(Resource::File(path)) = location.resource else {
+                // No file path: still surface the diagnostic so JUnit consumers
+                // see failures (`--reporter=junit` must not swallow format issues).
+                status.set_description(message);
+                let case = TestCase::new(case_name, status);
+                let mut test_suite = TestSuite::new("biome");
+                test_suite
+                    .extra
+                    .insert("package".into(), "org.biome".into());
+                test_suite.add_test_case(case);
+                self.0.add_test_suite(test_suite);
+                continue;
+            };
 
-                status.set_description(format!(
-                    "line {row:?}, col {col:?}, {body}",
-                    row = start.line_number.get(),
-                    col = start.column_number.get(),
-                    body = message
-                ));
-                let mut case = TestCase::new(
-                    format!(
-                        "org.biome.{}",
-                        diagnostic
-                            .category()
-                            .map(|c| c.name())
-                            .unwrap_or_default()
-                            .replace('/', ".")
-                    ),
-                    status,
-                );
+            match (location.span, location.source_code) {
+                (Some(span), Some(source_code)) => {
+                    let source = SourceFile::new(source_code);
+                    let start = source.location(span.start())?;
 
-                if let Resource::File(path) = resource {
-                    let mut test_suite = TestSuite::new(path);
+                    status.set_description(format!(
+                        "line {row:?}, col {col:?}, {body}",
+                        row = start.line_number.get(),
+                        col = start.column_number.get(),
+                        body = message
+                    ));
+                    let mut case = TestCase::new(case_name, status);
                     case.extra
                         .insert("line".into(), start.line_number.get().to_string().into());
                     case.extra.insert(
                         "column".into(),
                         start.column_number.get().to_string().into(),
                     );
+                    let mut test_suite = TestSuite::new(path);
+                    test_suite
+                        .extra
+                        .insert("package".into(), "org.biome".into());
+                    test_suite.add_test_case(case);
+                    self.0.add_test_suite(test_suite);
+                }
+                _ => {
+                    // Format/diff diagnostics often pair a file resource with
+                    // advice-only location data (no text span). Emit a case for
+                    // the file so `--reporter=junit` is usable in CI (issue #5172).
+                    status.set_description(message);
+                    let case = TestCase::new(case_name, status);
+                    let mut test_suite = TestSuite::new(path);
                     test_suite
                         .extra
                         .insert("package".into(), "org.biome".into());
